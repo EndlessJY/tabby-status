@@ -1,6 +1,6 @@
 {
   "name": "tabby-status",
-  "version": "0.1.0",
+  "version": "0.1.1",
   "description": "System status side panel for Tabby SSH sessions",
   "author": "local",
   "keywords": [
@@ -12,7 +12,7 @@
     "build": "node node_modules/webpack/bin/webpack.js --mode production",
     "dev": "node node_modules/webpack/bin/webpack.js --mode development --watch",
     "pack:plugin": "npm run build && mkdir -p release && npm pack --pack-destination release",
-    "install-local": "npm run build && npm pack && npm install --prefix \"$HOME/Library/Application Support/tabby/plugins\" --omit=dev --legacy-peer-deps \"./tabby-status-0.1.0.tgz\"",
+    "install-local": "npm run build && TARBALL=$(npm pack --silent) && npm install --prefix \"$HOME/Library/Application Support/tabby/plugins\" --omit=dev --legacy-peer-deps \"./$TARBALL\"",
     "test:smoke": "npm run build && node tests/smoke.mjs"
   },
   "files": [

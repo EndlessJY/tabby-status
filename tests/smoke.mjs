@@ -172,6 +172,8 @@ function testTieredRefreshSource () {
   assert(source.includes('setMeterData(panel, \'mem\', this.formatPercent(payload.memPct), `${payload.memUsed}/${payload.memTotal}`)'), 'memory meter should keep percentage and capacity visible')
   assert(source.includes('setMeterData(panel, \'swap\', payload.swapTotal === \'0M\' ? \'未启用\' : this.formatPercent(payload.swapPct)'), 'swap meter should keep percentage and capacity visible when enabled')
   assert(source.includes('grid-template-columns: 38px minmax(0, 1fr)'), 'meter percentage and detail text must use aligned columns')
+  assert(source.includes('.tfs-meter-value span:first-child { text-align: left; }'), 'meter percentage and disabled text must share the same left edge')
+  assert(!source.includes('.tfs-meter-value.tfs-meter-no-detail { display: block; }'), 'meter rows without details must not switch to a different text layout')
   assert(source.includes('tfs-meter-no-detail'), 'meter rows without capacity details must have a stable no-detail state')
   assert(source.includes('data-k="mem-pct"') && source.includes('data-k="mem-detail"'), 'memory meter must split percent and detail into aligned nodes')
   assert(source.includes('tfs-resizer'), 'panel must include a horizontal resize handle')
