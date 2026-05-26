@@ -79,6 +79,8 @@ function testGithubWorkflow () {
   const workflowPath = path.join(root, '.github/workflows/build.yml')
   assert(fs.existsSync(workflowPath), 'GitHub Actions build workflow is missing')
   const workflow = fs.readFileSync(workflowPath, 'utf8')
+  assert(workflow.includes('FORCE_JAVASCRIPT_ACTIONS_TO_NODE24: true'), 'workflow should opt into the GitHub Actions Node 24 runtime')
+  assert(workflow.includes('node-version: 24'), 'workflow should build with Node.js 24')
   assert(workflow.includes('npm ci --legacy-peer-deps'), 'workflow must install with legacy peer deps for Tabby peer packages')
   assert(workflow.includes('node node_modules/typescript/bin/tsc --noEmit'), 'workflow must run TypeScript type check')
   assert(workflow.includes('npm run test:smoke'), 'workflow must run smoke tests')
