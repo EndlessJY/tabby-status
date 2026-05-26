@@ -21,6 +21,34 @@ Tabby SSH 系统状态侧边面板插件，提供服务器信息展示。
 
 ## 安装和验证
 
+### GitHub 自动构建
+
+仓库已配置 GitHub Actions。代码推送到 `main` 或发起 Pull Request 后，会自动执行类型检查、smoke test 和插件打包，并在 workflow run 的 Artifacts 里上传 `tabby-status-plugin`，里面包含可安装的 `.tgz`。
+
+如果需要发布固定版本，推送 `v*` tag 会自动创建 GitHub Release 并附带同一个 `.tgz`：
+
+```bash
+git tag v0.1.0
+git push origin v0.1.0
+```
+
+### 产物安装
+
+```bash
+npm install
+npm run pack:plugin
+```
+
+生成的安装包在：
+
+```text
+release/tabby-status-0.1.0.tgz
+```
+
+如果你的 Tabby 版本在插件页面支持从本地包安装，选择这个 `.tgz` 即可。安装后重启 Tabby。
+
+### 本机开发安装
+
 ```bash
 cd "/Users/endlessjy/Documents/AIGC/tabby-status"
 npm install
@@ -28,13 +56,14 @@ npm run test:smoke
 npm run install-local
 ```
 
-安装后重启 Tabby，重新连接 SSH。
+`install-local` 会直接把插件安装到当前 macOS 用户的 Tabby 插件目录。安装后重启 Tabby，重新连接 SSH。
 
 ## 常用命令
 
 ```bash
 npm run build
 npm run test:smoke
+npm run pack:plugin
 npm run install-local
 ```
 

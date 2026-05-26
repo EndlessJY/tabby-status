@@ -58,6 +58,7 @@ function testPackageShape () {
   assert(pkg.main === 'dist/index.js', 'package main must point to dist/index.js')
   assert(pkg.typings === 'dist/index.d.ts', 'package typings must point to generated declaration output')
   assert(pkg.scripts?.build?.startsWith('node node_modules/webpack/bin/webpack.js'), 'build script must not rely on quarantined .bin shebangs')
+  assert(pkg.scripts?.['pack:plugin']?.includes('npm pack --pack-destination release'), 'pack:plugin should create a distributable plugin artifact')
   assert(pkg.scripts?.['install-local']?.includes('npm install --prefix'), 'install-local should install directly into Tabby plugin prefix')
   assert(pkg.scripts?.['install-local']?.includes('--legacy-peer-deps'), 'install-local must not auto-install Tabby/Angular peer dependencies into the plugin directory')
 }
@@ -72,6 +73,19 @@ function testBuildOutput () {
   assert(source.includes('base64 -d | sh'), 'dist does not include encoded one-shot collector')
   assert(!source.includes('sendInput'), 'dist must not inject commands into the visible terminal')
   assert(!source.includes('registerOscHandler'), 'dist must not depend on terminal OSC parsing')
+}
+
+function testGithubWorkflow () {
+  const workflowPath = path.join(root, '.github/workflows/build.yml')
+  assert(fs.existsSync(workflowPath), 'GitHub Actions build workflow is missing')
+  const workflow = fs.readFileSync(workflowPath, 'utf8')
+  assert(workflow.includes('npm ci --legacy-peer-deps'), 'workflow must install with legacy peer deps for Tabby peer packages')
+  assert(workflow.includes('node node_modules/typescript/bin/tsc --noEmit'), 'workflow must run TypeScript type check')
+  assert(workflow.includes('npm run test:smoke'), 'workflow must run smoke tests')
+  assert(workflow.includes('npm run pack:plugin'), 'workflow must build the installable plugin package')
+  assert(workflow.includes('actions/upload-artifact@v4'), 'workflow must upload the plugin tgz as an Actions artifact')
+  assert(workflow.includes('softprops/action-gh-release@v2'), 'workflow must publish tgz files on version tags')
+  assert(workflow.includes('release/*.tgz'), 'workflow must publish the generated tgz files')
 }
 
 function testTieredRefreshSource () {
@@ -244,6 +258,7 @@ test "$decoded" = "$(printf "ip\t127.0.0.1\nlatency\t1")"`
 
 testPackageShape()
 testBuildOutput()
+testGithubWorkflow()
 testTieredRefreshSource()
 testPayloadParser()
 testLargeCpuCounterFormatting()
