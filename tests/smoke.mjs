@@ -161,7 +161,7 @@ function testTieredRefreshSource () {
   assert(source.includes('white-space: nowrap'), 'meter values must stay on one line')
   assert(source.includes('.tfs-nowrap'), 'shared no-wrap class must protect compact labels')
   assert(source.includes('min-width: 0'), 'compact grid/flex labels must be allowed to ellipsize on one line')
-  assert(source.includes('grid-template-columns: 42px minmax(104px, 1fr) 132px'), 'meter rows must preserve details while keeping the progress bar usable')
+  assert(source.includes('grid-template-columns: 42px minmax(148px, 1fr) max-content'), 'meter rows must give spare width to the progress bar instead of a fixed value column')
   assert(source.includes('color: rgba(215,222,224,.62)'), 'meter value text must be visually subdued')
   assert(source.includes('.tfs-meter b { text-align: left'), 'meter values must sit close to the progress bar')
   assert(source.includes('font-size: 11px'), 'meter value text must stay secondary to the bar')

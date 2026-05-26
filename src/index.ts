@@ -890,7 +890,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       .tfs-kv span, .tfs-meter span { color: #91a0a5; }
       .tfs-kv span { width: 34px; }
       .tfs-kv b { font-weight: 500; color: #edf3f5; }
-      .tfs-meter { display: grid; grid-template-columns: 42px minmax(104px, 1fr) 132px; align-items: center; column-gap: 8px; padding: 3px 10px; }
+      .tfs-meter { display: grid; grid-template-columns: 42px minmax(148px, 1fr) max-content; align-items: center; column-gap: 8px; padding: 3px 10px; }
       .tfs-meter span { overflow: hidden; text-overflow: ellipsis; }
       .tfs-meter i { position: relative; flex: 1; height: 8px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
       .tfs-meter em { display: block; height: 100%; background: linear-gradient(90deg, #5fb3ff, #31c66b); opacity: .95; }

@@ -28,8 +28,8 @@ Tabby SSH 系统状态侧边面板插件，提供服务器信息展示。
 如果需要发布固定版本，推送 `v*` tag 会自动创建 GitHub Release 并附带同一个 `.tgz`：
 
 ```bash
-git tag v0.1.2
-git push origin v0.1.2
+git tag v0.1.3
+git push origin v0.1.3
 ```
 
 ### 产物安装
