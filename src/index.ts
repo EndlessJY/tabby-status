@@ -16,12 +16,60 @@ type ProcessRow = {
   command: string
 }
 
+type ProcessDetailRow = {
+  pid: string
+  user: string
+  mem: string
+  cpu: string
+  command: string
+  location: string
+}
+
+type NetworkDetailRow = {
+  pid: string
+  name: string
+  listenIp: string
+  port: string
+  ipCount: string
+  connCount: string
+  upload: string
+  download: string
+  uploadBytes?: number
+  downloadBytes?: number
+}
+
+type LatencyDetailRow = {
+  ip: string
+  latency: string
+  loss: string
+  location: string
+}
+
 type ProcessSortKey = 'mem' | 'cpu'
 type ProcessSortDirection = 'desc' | 'asc'
 
 type ProcessSortState = {
   key: ProcessSortKey
   direction: ProcessSortDirection
+}
+
+type DetailKind = 'process' | 'network' | 'latency'
+type DetailSortDirection = 'desc' | 'asc'
+
+type DetailSortState = {
+  key: string
+  direction: DetailSortDirection
+}
+
+type DetailModalState = {
+  kind: DetailKind
+  modal: HTMLElement
+  body: HTMLElement
+  title: HTMLElement
+  status: HTMLElement
+  timer?: number
+  inflight: boolean
+  networkSnapshots?: Map<string, { uploadBytes: number, downloadBytes: number, ts: number }>
 }
 
 type StatusPayload = {
@@ -89,6 +137,8 @@ export class TabbyStatusDecorator extends TerminalDecorator {
   private netHistory = new WeakMap<BaseTerminalTabComponent<any>, NetHistory>()
   private latencyHistory = new WeakMap<BaseTerminalTabComponent<any>, LatencyHistory>()
   private processSort = new WeakMap<BaseTerminalTabComponent<any>, ProcessSortState>()
+  private detailModals = new WeakMap<BaseTerminalTabComponent<any>, DetailModalState>()
+  private detailSort = new WeakMap<BaseTerminalTabComponent<any>, DetailSortState>()
 
   attach (terminal: BaseTerminalTabComponent<any>): void {
     super.attach(terminal)
@@ -98,6 +148,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
 
     const panel = this.createPanel()
     this.bindProcessSorting(terminal, panel)
+    this.bindDetailEntrypoints(terminal, panel)
     this.panels.set(terminal, panel)
     this.mountPanel(terminal, panel)
 
@@ -125,6 +176,8 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     this.netHistory.delete(terminal)
     this.latencyHistory.delete(terminal)
     this.processSort.delete(terminal)
+    this.closeDetailModal(terminal)
+    this.detailSort.delete(terminal)
     super.detach(terminal)
   }
 
@@ -375,12 +428,12 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       <div class="tfs-meter"><span>CPU</span><i><em data-bar="cpu"></em></i><b class="tfs-meter-value" data-meter="cpu"><span data-k="cpu-pct"></span><span data-k="cpu-detail"></span></b></div>
       <div class="tfs-meter"><span>内存</span><i><em data-bar="mem"></em></i><b class="tfs-meter-value" data-meter="mem"><span data-k="mem-pct">-</span><span data-k="mem-detail"></span></b></div>
       <div class="tfs-meter"><span>交换</span><i><em data-bar="swap"></em></i><b class="tfs-meter-value" data-meter="swap"><span data-k="swap-pct">-</span><span data-k="swap-detail"></span></b></div>
-      <div class="tfs-section">进程</div>
+      <div class="tfs-section tfs-clickable" data-open-detail="process" title="打开进程详情">进程</div>
       <div class="tfs-tabs"><button type="button" data-sort="mem" aria-pressed="false" title="按内存排序">内存</button><button type="button" data-sort="cpu" aria-pressed="false" title="按 CPU 排序">CPU</button><span>命令</span></div>
-      <div class="tfs-processes" data-k="processes"></div>
-      <div class="tfs-section">网络</div>
-      <div class="tfs-chart"><div class="tfs-chart-head tfs-net-head tfs-nowrap"><b data-k="tx">0B/s</b><b data-k="rx">0B/s</b><strong data-k="net-peak">峰值 -</strong><strong data-k="iface">-</strong></div><div class="tfs-net-bars tfs-idle" data-k="net-bars"></div></div>
-      <div class="tfs-chart tfs-lat"><div class="tfs-chart-head tfs-lat-head tfs-nowrap"><b data-k="latency">0ms</b><strong data-k="latency-peak">延迟 -</strong></div><div class="tfs-latency-bars tfs-idle" data-k="latency-bars"></div></div>
+      <div class="tfs-processes tfs-clickable" data-open-detail="process" data-k="processes" title="打开进程详情"></div>
+      <div class="tfs-section tfs-clickable" data-open-detail="network" title="打开网络详情">网络</div>
+      <div class="tfs-chart tfs-clickable" data-open-detail="network" title="打开网络详情"><div class="tfs-chart-head tfs-net-head tfs-nowrap"><b data-k="tx">0B/s</b><b data-k="rx">0B/s</b><strong data-k="net-peak">峰值 -</strong><strong data-k="iface">-</strong></div><div class="tfs-net-bars tfs-idle" data-k="net-bars"></div></div>
+      <div class="tfs-chart tfs-lat tfs-clickable" data-open-detail="latency" title="打开延迟详情"><div class="tfs-chart-head tfs-lat-head tfs-nowrap"><b data-k="latency">0ms</b><strong data-k="latency-peak">延迟 -</strong></div><div class="tfs-latency-bars tfs-idle" data-k="latency-bars"></div></div>
       <div class="tfs-section">磁盘</div>
       <table><thead><tr><th>路径</th><th>可用/大小</th></tr></thead><tbody data-k="disks"></tbody></table>
       <div class="tfs-resizer" title="拖动调整面板宽度"></div>
@@ -416,6 +469,530 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       }
 
       button.addEventListener('click', toggleSort)
+    }
+  }
+
+  private bindDetailEntrypoints (terminal: BaseTerminalTabComponent<any>, panel: HTMLElement): void {
+    for (const node of Array.from(panel.querySelectorAll<HTMLElement>('[data-open-detail]'))) {
+      const kind = node.dataset.openDetail
+      if (kind !== 'process' && kind !== 'network' && kind !== 'latency') {
+        continue
+      }
+      node.addEventListener('click', event => {
+        if ((event.target as HTMLElement).closest('button')) {
+          return
+        }
+        this.openDetailModal(terminal, kind)
+      })
+    }
+  }
+
+  private openDetailModal (terminal: BaseTerminalTabComponent<any>, kind: DetailKind): void {
+    this.closeDetailModal(terminal)
+    this.detailSort.delete(terminal)
+
+    const modal = document.createElement('div')
+    modal.className = 'tfs-detail-backdrop'
+    modal.innerHTML = `
+      <div class="tfs-detail-dialog" role="dialog" aria-modal="true">
+        <div class="tfs-detail-top">
+          <strong></strong>
+          <span data-k="detail-status"></span>
+          <button type="button" title="关闭">关闭</button>
+        </div>
+        <div class="tfs-detail-body"></div>
+      </div>
+    `
+
+    const title = modal.querySelector('.tfs-detail-top strong') as HTMLElement
+    const status = modal.querySelector('[data-k="detail-status"]') as HTMLElement
+    const body = modal.querySelector('.tfs-detail-body') as HTMLElement
+    title.textContent = this.getDetailTitle(kind)
+
+    modal.addEventListener('click', event => {
+      if (event.target === modal) {
+        this.closeDetailModal(terminal)
+      }
+    })
+    modal.querySelector('button')?.addEventListener('click', () => this.closeDetailModal(terminal))
+
+    document.body.appendChild(modal)
+    const state: DetailModalState = { kind, modal, body, title, status, inflight: false, networkSnapshots: kind === 'network' ? new Map() : undefined }
+    this.detailModals.set(terminal, state)
+    this.renderDetailShell(terminal, state)
+    const refresh = () => void this.refreshDetailModal(terminal)
+    state.timer = window.setInterval(refresh, 1000)
+    refresh()
+  }
+
+  private closeDetailModal (terminal: BaseTerminalTabComponent<any>): void {
+    const state = this.detailModals.get(terminal)
+    if (!state) {
+      return
+    }
+    if (state.timer !== undefined) {
+      window.clearInterval(state.timer)
+    }
+    this.closeContextMenu()
+    state.modal.remove()
+    this.detailModals.delete(terminal)
+  }
+
+  private async refreshDetailModal (terminal: BaseTerminalTabComponent<any>): Promise<void> {
+    const state = this.detailModals.get(terminal)
+    if (!state || state.inflight) {
+      return
+    }
+
+    const sshSession = (terminal as any).sshSession ?? (terminal.session as any)?.ssh
+    const ssh = sshSession?.ssh
+    if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
+      state.status.textContent = '等待 SSH'
+      return
+    }
+
+    state.inflight = true
+    try {
+      const text = await this.runSshExec(ssh, this.detailCollectorExecCommand(state.kind))
+      if (this.detailModals.get(terminal) !== state) {
+        return
+      }
+      state.status.textContent = ''
+      this.renderDetailRows(terminal, state, text)
+    } catch (error) {
+      if (this.detailModals.get(terminal) === state) {
+        state.status.textContent = `刷新失败: ${error instanceof Error ? error.message : String(error)}`
+      }
+    } finally {
+      state.inflight = false
+    }
+  }
+
+  private getDetailTitle (kind: DetailKind): string {
+    if (kind === 'process') {
+      return '进程详情'
+    }
+    if (kind === 'network') {
+      return '网络详情'
+    }
+    return '延迟详情'
+  }
+
+  private renderDetailShell (terminal: BaseTerminalTabComponent<any>, state: DetailModalState): void {
+    const columns = this.getDetailColumns(state.kind)
+    state.body.innerHTML = `
+      <table class="tfs-detail-table">
+        <colgroup>${columns.map(column => `<col data-col="${column.key}"${column.width ? ` style="width:${column.width}px"` : ''}>`).join('')}</colgroup>
+        <thead><tr>${columns.map(column => `<th class="tfs-resizable-col">${column.sortable ? `<button type="button" data-detail-sort="${column.key}">${this.escape(column.label)}</button>` : this.escape(column.label)}<span class="tfs-col-resizer" data-resize-col="${column.key}" title="拖动调整列宽"></span></th>`).join('')}</tr></thead>
+        <tbody></tbody>
+      </table>
+    `
+
+    for (const button of Array.from(state.body.querySelectorAll<HTMLButtonElement>('button[data-detail-sort]'))) {
+      button.addEventListener('click', () => {
+        const key = button.dataset.detailSort || ''
+        const current = this.detailSort.get(terminal)
+        const direction: DetailSortDirection = current?.key === key && current.direction === 'desc' ? 'asc' : 'desc'
+        this.detailSort.set(terminal, { key, direction })
+        void this.refreshDetailModal(terminal)
+      })
+    }
+    this.bindDetailColumnResize(state)
+    this.bindDetailContextMenu(terminal, state)
+  }
+
+  private bindDetailContextMenu (terminal: BaseTerminalTabComponent<any>, state: DetailModalState): void {
+    state.body.addEventListener('contextmenu', event => {
+      if (state.kind !== 'process') {
+        return
+      }
+      const row = (event.target as HTMLElement).closest<HTMLTableRowElement>('tr[data-process-pid]')
+      if (!row) {
+        return
+      }
+      event.preventDefault()
+      this.openProcessContextMenu(terminal, state, row, event.clientX, event.clientY)
+    })
+  }
+
+  private openProcessContextMenu (terminal: BaseTerminalTabComponent<any>, state: DetailModalState, row: HTMLTableRowElement, x: number, y: number): void {
+    this.closeContextMenu()
+    const pid = row.dataset.processPid || ''
+    const name = row.dataset.processName || ''
+    const command = row.dataset.processCommand || ''
+    const location = row.dataset.processLocation || ''
+    const menu = document.createElement('div')
+    menu.className = 'tfs-context-menu'
+    menu.style.left = `${x}px`
+    menu.style.top = `${y}px`
+    menu.innerHTML = `
+      <button type="button" data-action="kill">终止进程</button>
+      <button type="button" data-action="copy-pid">复制PID</button>
+      <button type="button" data-action="copy-name">复制名称</button>
+      <button type="button" data-action="copy-command">复制命令</button>
+      <button type="button" data-action="copy-location">复制位置</button>
+    `
+
+    menu.addEventListener('click', event => {
+      const action = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-action]')?.dataset.action
+      if (!action) {
+        return
+      }
+      if (action === 'kill') {
+        void this.terminateProcess(terminal, state, pid)
+      } else if (action === 'copy-pid') {
+        void navigator.clipboard?.writeText(pid)
+      } else if (action === 'copy-name') {
+        void navigator.clipboard?.writeText(name)
+      } else if (action === 'copy-command') {
+        void navigator.clipboard?.writeText(command)
+      } else if (action === 'copy-location') {
+        void navigator.clipboard?.writeText(location)
+      }
+      this.closeContextMenu()
+    })
+
+    document.body.appendChild(menu)
+    const rect = menu.getBoundingClientRect()
+    if (rect.right > window.innerWidth) {
+      menu.style.left = `${Math.max(8, window.innerWidth - rect.width - 8)}px`
+    }
+    if (rect.bottom > window.innerHeight) {
+      menu.style.top = `${Math.max(8, window.innerHeight - rect.height - 8)}px`
+    }
+    window.setTimeout(() => {
+      const close = () => {
+        this.closeContextMenu()
+        document.removeEventListener('click', close)
+      }
+      document.addEventListener('click', close)
+    })
+  }
+
+  private closeContextMenu (): void {
+    for (const menu of Array.from(document.querySelectorAll('.tfs-context-menu'))) {
+      menu.remove()
+    }
+  }
+
+  private async terminateProcess (terminal: BaseTerminalTabComponent<any>, state: DetailModalState, pid: string): Promise<void> {
+    if (!/^[0-9]+$/.test(pid)) {
+      state.status.textContent = 'PID 无效'
+      return
+    }
+    const sshSession = (terminal as any).sshSession ?? (terminal.session as any)?.ssh
+    const ssh = sshSession?.ssh
+    if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
+      state.status.textContent = '等待 SSH'
+      return
+    }
+    try {
+      await this.runSshExec(ssh, this.encodeShellScript(`kill -TERM ${pid}`))
+      state.status.textContent = `已终止 PID ${pid}`
+      void this.refreshDetailModal(terminal)
+    } catch (error) {
+      state.status.textContent = `终止失败: ${error instanceof Error ? error.message : String(error)}`
+    }
+  }
+
+  private bindDetailColumnResize (state: DetailModalState): void {
+    for (const handle of Array.from(state.body.querySelectorAll<HTMLElement>('.tfs-col-resizer[data-resize-col]'))) {
+      handle.addEventListener('mousedown', event => {
+        event.preventDefault()
+        event.stopPropagation()
+        const key = handle.dataset.resizeCol
+        const col = key ? state.body.querySelector<HTMLTableColElement>(`col[data-col="${key}"]`) : null
+        if (!col) {
+          return
+        }
+        const startX = event.clientX
+        const startWidth = col.getBoundingClientRect().width || Number(col.style.width.replace('px', '')) || 220
+        const move = (moveEvent: MouseEvent) => {
+          const width = Math.max(140, Math.min(720, Math.round(startWidth + moveEvent.clientX - startX)))
+          col.style.width = `${width}px`
+        }
+        const up = () => {
+          window.removeEventListener('mousemove', move)
+          window.removeEventListener('mouseup', up)
+          document.body.classList.remove('tfs-col-resizing')
+        }
+        document.body.classList.add('tfs-col-resizing')
+        window.addEventListener('mousemove', move)
+        window.addEventListener('mouseup', up)
+      })
+    }
+  }
+
+  private getDetailColumns (kind: DetailKind): Array<{ key: string, label: string, sortable: boolean, width?: number }> {
+    if (kind === 'process') {
+      return [
+        { key: 'pid', label: 'PID', sortable: true, width: 72 },
+        { key: 'user', label: '用户', sortable: true, width: 96 },
+        { key: 'mem', label: '内存', sortable: true, width: 72 },
+        { key: 'cpu', label: 'CPU', sortable: true, width: 72 },
+        { key: 'command', label: '命令', sortable: false, width: 260 },
+        { key: 'location', label: '位置', sortable: false, width: 320 },
+      ]
+    }
+    if (kind === 'network') {
+      return [
+        { key: 'pid', label: 'PID', sortable: true, width: 72 },
+        { key: 'name', label: '名称', sortable: true, width: 130 },
+        { key: 'listenIp', label: '监听IP', sortable: true, width: 150 },
+        { key: 'port', label: '端口', sortable: true, width: 82 },
+        { key: 'ipCount', label: 'IP数', sortable: true, width: 76 },
+        { key: 'connCount', label: '连接数', sortable: true, width: 86 },
+        { key: 'upload', label: '上传', sortable: true, width: 92 },
+        { key: 'download', label: '下载', sortable: true, width: 92 },
+      ]
+    }
+    return [
+      { key: 'ip', label: 'IP', sortable: false, width: 180 },
+      { key: 'latency', label: '延迟', sortable: false, width: 110 },
+      { key: 'loss', label: '丢包', sortable: false, width: 90 },
+      { key: 'location', label: '位置', sortable: false, width: 140 },
+    ]
+  }
+
+  private detailCollectorExecCommand (kind: DetailKind): string {
+    if (kind === 'process') {
+      return this.processDetailCollectorExecCommand()
+    }
+    if (kind === 'network') {
+      return this.networkDetailCollectorExecCommand()
+    }
+    return this.latencyDetailCollectorExecCommand()
+  }
+
+  private processDetailCollectorExecCommand (): string {
+    const script = String.raw`os=$(uname -s 2>/dev/null)
+if [ "$os" = "Darwin" ]; then
+  ps axo pid,user,pmem,pcpu,command -r 2>/dev/null | awk 'NR>1{cmd=$5; for(i=6;i<=NF;i++) cmd=cmd" "$i; printf "pdetail\t%s\t%s\t%s\t%s\t%s\t-\n",$1,$2,$3,$4,cmd; count++; if(count>=80) exit}'
+else
+  ps -eo pid,user,pmem,pcpu,args --sort=-pcpu 2>/dev/null | awk 'NR>1{cmd=$5; for(i=6;i<=NF;i++) cmd=cmd" "$i; printf "%s\t%s\t%s\t%s\t%s\n",$1,$2,$3,$4,cmd; count++; if(count>=80) exit}' | while IFS="$(printf '\t')" read -r pid user mem cpu cmd; do
+    loc=$(readlink "/proc/$pid/cwd" 2>/dev/null || readlink "/proc/$pid/exe" 2>/dev/null || printf "-")
+    printf "pdetail\t%s\t%s\t%s\t%s\t%s\t%s\n" "$pid" "$user" "$mem" "$cpu" "$cmd" "$loc"
+  done
+fi
+`
+    return this.encodeShellScript(script)
+  }
+
+  private networkDetailCollectorExecCommand (): string {
+    const script = String.raw`if command -v ss >/dev/null 2>&1; then
+  ss -H -tunapi 2>/dev/null | awk '
+  /^[[:space:]]/ { record=record " " $0; next }
+  { if (record!="") print record; record=$0 }
+  END { if (record!="") print record }
+  ' | awk '
+  function strip_addr(value, result, n) {
+    gsub(/^\[/, "", value); gsub(/\]$/, "", value)
+    n=split(value, result, ":")
+    return n > 1 ? result[n] : "-"
+  }
+  function host_part(value) {
+    gsub(/^\[/, "", value); gsub(/\]$/, "", value)
+    sub(/:[^:]*$/, "", value)
+    return value == "" ? "*" : value
+  }
+  {
+    if ($1 !~ /^(tcp|udp|raw|u_str|icmp)/ && NF < 5) next
+    local=$5; peer=$6; pid="-"; name="-"
+    if (match($0, /pid=[0-9]+/)) { pid=substr($0, RSTART+4, RLENGTH-4) }
+    if (match($0, /\("[^"]+"/)) { name=substr($0, RSTART+2, RLENGTH-3) }
+    port=strip_addr(local)
+    listen=host_part(local)
+    key=pid "|" name "|" listen "|" port
+    conn[key]++
+    sent=0; received=0
+    if (match($0, /bytes_sent:[0-9]+/)) sent=substr($0, RSTART+11, RLENGTH-11)
+    if (match($0, /bytes_received:[0-9]+/)) received=substr($0, RSTART+15, RLENGTH-15)
+    upload[key]+=sent
+    download[key]+=received
+    if (peer != "*:*" && peer != "-") {
+      remote=host_part(peer)
+      if (remote != "*" && remote != "") {
+        seen=key "|" remote
+        if (!remoteSeen[seen]++) ipCount[key]++
+      }
+    }
+    meta[key]=pid "\t" name "\t" listen "\t" port
+  }
+  END {
+    for (key in conn) {
+      printf "ndetail\t%s\t%s\t%s\t%s\t%s\n", meta[key], ipCount[key]+0, conn[key]+0, upload[key]+0, download[key]+0
+    }
+  }' | sort -t "$(printf '\t')" -k7,7nr | head -120
+else
+  netstat -tunap 2>/dev/null | awk 'NR>2{print "ndetail\t-\t-\t-\t-\t0\t0\t0\t0"}' | head -1
+fi
+`
+    return this.encodeShellScript(script)
+  }
+
+  private latencyDetailCollectorExecCommand (): string {
+    const script = String.raw`target=1.1.1.1
+if command -v traceroute >/dev/null 2>&1; then
+  traceroute -n -w 1 -q 1 -m 12 "$target" 2>/dev/null | awk 'NR>1{hop=$1; ip=$2; if(ip=="*"||ip=="") {printf "ldetail\t*\t-\t100%%\t第%s跳\n", hop; next} lat=$3; loss="-"; if(lat=="*"||lat=="") lat="-"; else lat=sprintf("%.0fms", lat); printf "ldetail\t%s\t%s\t%s\t第%s跳\n", ip, lat, loss, hop}'
+elif command -v tracepath >/dev/null 2>&1; then
+  tracepath -n -m 12 "$target" 2>/dev/null | awk '{hop=$1; ip=$2; lat="-"; for(i=1;i<=NF;i++){if($i=="ms"){lat=sprintf("%.0fms", $(i-1))}} if(hop ~ /^[0-9]+:/){gsub(":","",hop); if(ip=="no") ip="*"; printf "ldetail\t%s\t%s\t%s\t第%s跳\n", ip, lat, ip=="*"?"100%":"-", hop}}'
+else
+  ping -c 4 -W 1 "$target" 2>/dev/null | awk -v target="$target" -F', ' '/packet loss/{loss=$3} /min\/avg\/max/{split($4,a,"/"); lat=sprintf("%.0fms", a[2])} END{if(loss=="") loss="100%"; if(lat=="") lat="-"; printf "ldetail\t%s\t%s\t%s\t目标\n", target, lat, loss}'
+fi
+`
+    return this.encodeShellScript(script)
+  }
+
+  private renderDetailRows (terminal: BaseTerminalTabComponent<any>, state: DetailModalState, text: string): void {
+    const body = state.body.querySelector('tbody')
+    if (!body) {
+      return
+    }
+    const sort = this.detailSort.get(terminal)
+    this.renderDetailSortState(state, sort)
+
+    if (state.kind === 'process') {
+      const rows = this.sortDetailRows(this.parseProcessDetails(text), sort)
+      body.innerHTML = rows.map(row => `
+        <tr data-process-pid="${this.escape(row.pid)}" data-process-name="${this.escape(this.getProcessName(row.command))}" data-process-command="${this.escape(row.command)}" data-process-location="${this.escape(row.location)}">
+          <td>${this.escape(row.pid)}</td>
+          <td>${this.escape(row.user)}</td>
+          <td>${this.escape(row.mem)}%</td>
+          <td>${this.escape(row.cpu)}%</td>
+          <td title="${this.escape(row.command)}">${this.escape(row.command)}</td>
+          <td title="${this.escape(row.location)}">${this.escape(row.location)}</td>
+        </tr>
+      `).join('')
+      return
+    }
+
+    if (state.kind === 'network') {
+      const rows = this.sortDetailRows(this.withNetworkRates(state, this.parseNetworkDetails(text)), sort)
+      body.innerHTML = rows.map(row => `
+        <tr>
+          <td>${this.escape(row.pid)}</td>
+          <td>${this.escape(row.name)}</td>
+          <td title="${this.escape(row.listenIp)}">${this.escape(row.listenIp)}</td>
+          <td>${this.escape(row.port)}</td>
+          <td>${this.escape(row.ipCount)}</td>
+          <td>${this.escape(row.connCount)}</td>
+          <td>${this.escape(row.upload)}</td>
+          <td>${this.escape(row.download)}</td>
+        </tr>
+      `).join('')
+      return
+    }
+
+    const rows = this.parseLatencyDetails(text)
+    body.innerHTML = rows.map(row => `
+      <tr>
+        <td>${this.escape(row.ip)}</td>
+        <td>${this.escape(row.latency)}</td>
+        <td>${this.escape(row.loss)}</td>
+        <td>${this.escape(row.location)}</td>
+      </tr>
+    `).join('')
+  }
+
+  private parseProcessDetails (text: string): ProcessDetailRow[] {
+    return text.split(/\r?\n/).filter(Boolean).map(line => line.split('\t')).filter(parts => parts[0] === 'pdetail').map(parts => ({
+      pid: parts[1] || '-',
+      user: parts[2] || '-',
+      mem: parts[3] || '0',
+      cpu: parts[4] || '0',
+      command: parts[5] || '-',
+      location: parts[6] || '-',
+    }))
+  }
+
+  private getProcessName (command: string): string {
+    const first = String(command || '').trim().split(/\s+/)[0] || '-'
+    const parts = first.split('/')
+    return parts[parts.length - 1] || first
+  }
+
+  private parseNetworkDetails (text: string): NetworkDetailRow[] {
+    return text.split(/\r?\n/).filter(Boolean).map(line => line.split('\t')).filter(parts => parts[0] === 'ndetail').map(parts => ({
+      pid: parts[1] || '-',
+      name: parts[2] || '-',
+      listenIp: parts[3] || '-',
+      port: parts[4] || '-',
+      ipCount: parts[5] || '0',
+      connCount: parts[6] || '0',
+      upload: '-',
+      download: '-',
+      uploadBytes: Number(parts[7] || 0),
+      downloadBytes: Number(parts[8] || 0),
+    }))
+  }
+
+  private withNetworkRates (state: DetailModalState, rows: NetworkDetailRow[]): NetworkDetailRow[] {
+    const now = Date.now()
+    const previous = state.networkSnapshots ?? new Map<string, { uploadBytes: number, downloadBytes: number, ts: number }>()
+    const next = new Map<string, { uploadBytes: number, downloadBytes: number, ts: number }>()
+    const withRates = rows.map(row => {
+      const key = `${row.pid}|${row.name}|${row.listenIp}|${row.port}`
+      const uploadBytes = Number(row.uploadBytes || 0)
+      const downloadBytes = Number(row.downloadBytes || 0)
+      const before = previous.get(key)
+      let upload = '-'
+      let download = '-'
+      if (before && uploadBytes >= before.uploadBytes && downloadBytes >= before.downloadBytes) {
+        const seconds = Math.max(0.001, (now - before.ts) / 1000)
+        upload = this.formatBytesPerSecond((uploadBytes - before.uploadBytes) / seconds)
+        download = this.formatBytesPerSecond((downloadBytes - before.downloadBytes) / seconds)
+      }
+      next.set(key, { uploadBytes, downloadBytes, ts: now })
+      return { ...row, upload, download }
+    })
+    state.networkSnapshots = next
+    return withRates
+  }
+
+  private parseLatencyDetails (text: string): LatencyDetailRow[] {
+    return text.split(/\r?\n/).filter(Boolean).map(line => line.split('\t')).filter(parts => parts[0] === 'ldetail').map(parts => ({
+      ip: parts[1] || '-',
+      latency: parts[2] || '-',
+      loss: parts[3] || '-',
+      location: parts[4] || '-',
+    }))
+  }
+
+  private sortDetailRows<T extends Record<string, unknown>> (rows: T[], sort?: DetailSortState): T[] {
+    if (!sort) {
+      return rows
+    }
+
+    const direction = sort.direction === 'asc' ? 1 : -1
+    return [...rows].sort((left, right) => {
+      const leftValue = String(left[sort.key] ?? '')
+      const rightValue = String(right[sort.key] ?? '')
+      const leftNumber = this.parseSortableNumber(leftValue)
+      const rightNumber = this.parseSortableNumber(rightValue)
+      const diff = Number.isFinite(leftNumber) && Number.isFinite(rightNumber)
+        ? leftNumber - rightNumber
+        : String(leftValue).localeCompare(String(rightValue))
+      return diff * direction
+    })
+  }
+
+  private parseSortableNumber (value: string): number {
+    if (value === '-' || value === '') {
+      return Number.NaN
+    }
+    const parsed = Number(String(value).replace(/[%A-Za-z/]+/g, ''))
+    return Number.isFinite(parsed) ? parsed : Number.NaN
+  }
+
+  private renderDetailSortState (state: DetailModalState, sort?: DetailSortState): void {
+    for (const button of Array.from(state.body.querySelectorAll<HTMLButtonElement>('button[data-detail-sort]'))) {
+      const active = sort?.key === button.dataset.detailSort
+      button.classList.toggle('tfs-sort-active', active)
+      if (active && sort) {
+        button.dataset.dir = sort.direction
+      } else {
+        button.removeAttribute('data-dir')
+      }
     }
   }
 
@@ -901,6 +1478,8 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       .tfs-meter-value.tfs-meter-no-detail span:last-child { display: none; }
       .tfs-meter b.tfs-disabled-value { color: rgba(215,222,224,.48); font-weight: 500; }
       .tfs-section { margin: 10px 10px 5px; color: #7fc8ff; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }
+      .tfs-clickable { cursor: pointer; }
+      .tfs-clickable:hover { background: rgba(127,200,255,.06); }
       .tfs-tabs, .tfs-processes div { --tfs-proc-columns: 56px 56px minmax(0, 1fr); }
       .tfs-tabs { display: grid; grid-template-columns: var(--tfs-proc-columns); column-gap: 8px; color: #8ea1a7; border-top: 1px solid rgba(255,255,255,.08); border-bottom: 1px solid rgba(255,255,255,.08); margin: 0 10px; }
       .tfs-tabs button, .tfs-tabs span { padding: 4px 0; font-size: 11px; text-align: left; min-width: 0; }
@@ -941,6 +1520,34 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       .tabby-status td:last-child { text-align: right; }
       .tabby-status td:last-child i { position: absolute; top: 0; right: 0; bottom: 0; background: rgba(49, 198, 107, .16); z-index: 0; }
       .tabby-status td:last-child span { position: relative; z-index: 1; }
+      .tfs-detail-backdrop { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: rgba(8,12,14,.58); }
+      .tfs-detail-dialog { width: min(980px, calc(100vw - 56px)); height: min(680px, calc(100vh - 56px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(127,200,255,.22); background: #1f272a; color: #d7dee0; box-shadow: 0 18px 60px rgba(0,0,0,.42); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; }
+      .tfs-detail-top { display: grid; grid-template-columns: max-content 1fr max-content; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.1); }
+      .tfs-detail-top strong { font-size: 14px; color: #edf3f5; }
+      .tfs-detail-top span { color: #8ea1a7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tfs-detail-top button { border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: #d7dee0; padding: 4px 10px; font: inherit; cursor: pointer; }
+      .tfs-detail-body { flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: rgba(127,200,255,.42) rgba(255,255,255,.06); }
+      .tfs-detail-body::-webkit-scrollbar { width: 8px; height: 8px; }
+      .tfs-detail-body::-webkit-scrollbar-track { background: rgba(255,255,255,.06); }
+      .tfs-detail-body::-webkit-scrollbar-thumb { background: rgba(127,200,255,.42); border-radius: 8px; }
+      .tfs-detail-body::-webkit-scrollbar-thumb:hover { background: rgba(127,200,255,.62); }
+      .tfs-detail-table { width: max-content; min-width: 100%; border-collapse: collapse; table-layout: fixed; }
+      .tfs-detail-table th, .tfs-detail-table td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,.07); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+      .tfs-detail-table th { position: sticky; top: 0; z-index: 1; background: #232c2f; color: #8ea1a7; font-weight: 600; }
+      .tfs-detail-table th.tfs-resizable-col { position: sticky; }
+      .tfs-detail-table td { color: #d7dee0; font-variant-numeric: tabular-nums; }
+      .tfs-detail-table tr:nth-child(even) td { background: rgba(255,255,255,.025); }
+      .tfs-detail-table th button { border: 0; background: transparent; color: inherit; padding: 0; font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
+      .tfs-detail-table th button:hover, .tfs-detail-table th button.tfs-sort-active { color: #edf3f5; }
+      .tfs-detail-table th button[data-dir="desc"]::after { content: "↓"; color: #7fc8ff; font-size: 10px; }
+      .tfs-detail-table th button[data-dir="asc"]::after { content: "↑"; color: #7fc8ff; font-size: 10px; }
+      .tfs-col-resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: col-resize; }
+      .tfs-col-resizer::after { content: ""; position: absolute; top: 6px; right: 3px; bottom: 6px; width: 1px; background: rgba(127,200,255,.2); }
+      .tfs-col-resizer:hover::after, .tfs-col-resizing .tfs-col-resizer::after { background: rgba(127,200,255,.72); }
+      .tfs-col-resizing { cursor: col-resize !important; user-select: none !important; }
+      .tfs-context-menu { position: fixed; z-index: 10000; min-width: 132px; padding: 5px; border: 1px solid rgba(127,200,255,.24); background: #232c2f; box-shadow: 0 12px 32px rgba(0,0,0,.38); }
+      .tfs-context-menu button { display: block; width: 100%; border: 0; background: transparent; color: #d7dee0; padding: 6px 9px; text-align: left; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; cursor: pointer; }
+      .tfs-context-menu button:hover { background: rgba(127,200,255,.12); color: #edf3f5; }
     `
     document.head.appendChild(style)
   }
