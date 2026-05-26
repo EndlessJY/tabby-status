@@ -667,7 +667,8 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
   }
 
   private formatPercent (value: number): string {
-    return Number.isInteger(value) ? `${value}%` : `${value.toFixed(1)}%`
+    const number = Number(value || 0)
+    return `${Math.round(Number.isFinite(number) ? number : 0)}%`
   }
 
   private parseDisks (value: string): DiskRow[] {
@@ -894,7 +895,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       .tfs-meter i { position: relative; flex: 1; height: 8px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
       .tfs-meter em { display: block; height: 100%; background: linear-gradient(90deg, #5fb3ff, #31c66b); opacity: .95; }
       .tfs-meter b { text-align: left; color: rgba(215,222,224,.62); font-weight: 500; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .tfs-meter-value { display: grid; grid-template-columns: 38px minmax(0, 1fr); align-items: center; column-gap: 6px; }
+      .tfs-meter-value { display: inline-flex; align-items: center; gap: 10px; }
       .tfs-meter-value span:first-child { text-align: left; }
       .tfs-meter-value span:last-child { text-align: left; overflow: hidden; text-overflow: ellipsis; }
       .tfs-meter-value.tfs-meter-no-detail span:last-child { display: none; }
