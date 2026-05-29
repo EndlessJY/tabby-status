@@ -39,10 +39,17 @@ type NetworkDetailRow = {
 }
 
 type LatencyDetailRow = {
+  hop: string
   ip: string
-  latency: string
-  loss: string
+  ptr: string
   location: string
+  asn: string
+  loss: string
+  sent: string
+  last: string
+  best: string
+  worst: string
+  avg: string
 }
 
 type ProcessSortKey = 'mem' | 'cpu'
@@ -61,14 +68,26 @@ type DetailSortState = {
   direction: DetailSortDirection
 }
 
+type DetailColumn = {
+  key: string
+  label: string
+  sortable: boolean
+  width: number
+  minWidth: number
+  maxWidth: number
+  fill?: boolean
+}
+
 type DetailModalState = {
   kind: DetailKind
   modal: HTMLElement
   body: HTMLElement
   title: HTMLElement
   status: HTMLElement
+  pauseButton: HTMLButtonElement
   timer?: number
   inflight: boolean
+  paused: boolean
   networkSnapshots?: Map<string, { uploadBytes: number, downloadBytes: number, ts: number }>
 }
 
@@ -163,7 +182,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     this.clearScheduledCollectors(terminal)
     this.panels.get(terminal)?.remove()
     const host = this.hosts.get(terminal)
-    host?.classList.remove('tabby-status-host')
+    host?.classList.remove('tabby-status-layout')
     host?.style.removeProperty('--tfs-panel-width')
     this.panels.delete(terminal)
     this.hosts.delete(terminal)
@@ -280,7 +299,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     }
   }
 
-  private async runSshExec (ssh: any, command: string): Promise<string> {
+  private async runSshExec (ssh: any, command: string, timeoutMs = 8000): Promise<string> {
     const channel = await ssh.activateChannel(await ssh.openSessionChannel())
     let output = ''
     let stderr = ''
@@ -297,7 +316,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     try {
       await channel.requestExec(command)
       await new Promise<void>((resolve, reject) => {
-        const timeout = window.setTimeout(() => reject(new Error('timeout')), 8000)
+        const timeout = window.setTimeout(() => reject(new Error('timeout')), timeoutMs)
         const finish = () => {
           window.clearTimeout(timeout)
           resolve()
@@ -425,9 +444,9 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       <div class="tfs-status" data-k="status"></div>
       <div class="tfs-kv"><span>运行</span><b data-k="uptime">-</b></div>
       <div class="tfs-kv"><span>负载</span><b data-k="load">-</b></div>
-      <div class="tfs-meter"><span>CPU</span><i><em data-bar="cpu"></em></i><b class="tfs-meter-value" data-meter="cpu"><span data-k="cpu-pct"></span><span data-k="cpu-detail"></span></b></div>
-      <div class="tfs-meter"><span>内存</span><i><em data-bar="mem"></em></i><b class="tfs-meter-value" data-meter="mem"><span data-k="mem-pct">-</span><span data-k="mem-detail"></span></b></div>
-      <div class="tfs-meter"><span>交换</span><i><em data-bar="swap"></em></i><b class="tfs-meter-value" data-meter="swap"><span data-k="swap-pct">-</span><span data-k="swap-detail"></span></b></div>
+      <div class="tfs-meter"><span>CPU</span><i><em data-bar="cpu"></em><b class="tfs-meter-value" data-meter="cpu"><span data-k="cpu-pct"></span><span data-k="cpu-detail"></span></b></i></div>
+      <div class="tfs-meter"><span>内存</span><i><em data-bar="mem"></em><b class="tfs-meter-value" data-meter="mem"><span data-k="mem-pct">-</span><span data-k="mem-detail"></span></b></i></div>
+      <div class="tfs-meter"><span>交换</span><i><em data-bar="swap"></em><b class="tfs-meter-value" data-meter="swap"><span data-k="swap-pct">-</span><span data-k="swap-detail"></span></b></i></div>
       <div class="tfs-section tfs-clickable" data-open-detail="process" title="打开进程详情">进程</div>
       <div class="tfs-tabs"><button type="button" data-sort="mem" aria-pressed="false" title="按内存排序">内存</button><button type="button" data-sort="cpu" aria-pressed="false" title="按 CPU 排序">CPU</button><span>命令</span></div>
       <div class="tfs-processes tfs-clickable" data-open-detail="process" data-k="processes" title="打开进程详情"></div>
@@ -496,7 +515,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     modal.innerHTML = `
       <div class="tfs-detail-dialog" role="dialog" aria-modal="true">
         <div class="tfs-detail-top">
-          <strong></strong>
+          <div class="tfs-detail-title"><strong></strong><button type="button" class="tfs-detail-icon-button" data-action="pause" title="暂停自动刷新" aria-label="暂停自动刷新"><span class="tfs-detail-pause-icon"></span></button></div>
           <span data-k="detail-status"></span>
           <button type="button" title="关闭">关闭</button>
         </div>
@@ -507,6 +526,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     const title = modal.querySelector('.tfs-detail-top strong') as HTMLElement
     const status = modal.querySelector('[data-k="detail-status"]') as HTMLElement
     const body = modal.querySelector('.tfs-detail-body') as HTMLElement
+    const pauseButton = modal.querySelector<HTMLButtonElement>('button[data-action="pause"]') as HTMLButtonElement
     title.textContent = this.getDetailTitle(kind)
 
     modal.addEventListener('click', event => {
@@ -514,15 +534,16 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
         this.closeDetailModal(terminal)
       }
     })
-    modal.querySelector('button')?.addEventListener('click', () => this.closeDetailModal(terminal))
+    pauseButton.addEventListener('click', () => this.toggleDetailPause(terminal))
+    const closeButton = Array.from(modal.querySelectorAll<HTMLButtonElement>('button')).find(button => button.dataset.action !== 'pause')
+    closeButton?.addEventListener('click', () => this.closeDetailModal(terminal))
 
     document.body.appendChild(modal)
-    const state: DetailModalState = { kind, modal, body, title, status, inflight: false, networkSnapshots: kind === 'network' ? new Map() : undefined }
+    const state: DetailModalState = { kind, modal, body, title, status, pauseButton, inflight: false, paused: false, networkSnapshots: kind === 'network' ? new Map() : undefined }
     this.detailModals.set(terminal, state)
     this.renderDetailShell(terminal, state)
-    const refresh = () => void this.refreshDetailModal(terminal)
-    state.timer = window.setInterval(refresh, 1000)
-    refresh()
+    this.startDetailRefreshTimer(terminal, state)
+    void this.refreshDetailModal(terminal)
   }
 
   private closeDetailModal (terminal: BaseTerminalTabComponent<any>): void {
@@ -540,7 +561,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
 
   private async refreshDetailModal (terminal: BaseTerminalTabComponent<any>): Promise<void> {
     const state = this.detailModals.get(terminal)
-    if (!state || state.inflight) {
+    if (!state || state.inflight || state.paused) {
       return
     }
 
@@ -553,7 +574,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
 
     state.inflight = true
     try {
-      const text = await this.runSshExec(ssh, this.detailCollectorExecCommand(state.kind))
+      const text = await this.runSshExec(ssh, this.detailCollectorExecCommand(state.kind), state.kind === 'latency' ? 30000 : 8000)
       if (this.detailModals.get(terminal) !== state) {
         return
       }
@@ -565,6 +586,34 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       }
     } finally {
       state.inflight = false
+    }
+  }
+
+  private startDetailRefreshTimer (terminal: BaseTerminalTabComponent<any>, state: DetailModalState): void {
+    if (state.timer !== undefined) {
+      window.clearInterval(state.timer)
+    }
+    const refresh = () => void this.refreshDetailModal(terminal)
+    state.timer = window.setInterval(refresh, 1000)
+  }
+
+  private toggleDetailPause (terminal: BaseTerminalTabComponent<any>): void {
+    const state = this.detailModals.get(terminal)
+    if (!state) {
+      return
+    }
+    state.paused = !state.paused
+    state.pauseButton.title = state.paused ? '继续自动刷新' : '暂停自动刷新'
+    state.pauseButton.setAttribute('aria-label', state.pauseButton.title)
+    state.pauseButton.classList.toggle('tfs-detail-paused', state.paused)
+    if (state.paused) {
+      if (state.timer !== undefined) {
+        window.clearInterval(state.timer)
+        state.timer = undefined
+      }
+    } else {
+      this.startDetailRefreshTimer(terminal, state)
+      void this.refreshDetailModal(terminal)
     }
   }
 
@@ -581,8 +630,8 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
   private renderDetailShell (terminal: BaseTerminalTabComponent<any>, state: DetailModalState): void {
     const columns = this.getDetailColumns(state.kind)
     state.body.innerHTML = `
-      <table class="tfs-detail-table">
-        <colgroup>${columns.map(column => `<col data-col="${column.key}"${column.width ? ` style="width:${column.width}px"` : ''}>`).join('')}</colgroup>
+      <table class="tfs-detail-table" style="width:${this.getDetailColumnsWidth(columns)}px">
+        <colgroup>${columns.map(column => `<col data-col="${column.key}" data-default-width="${column.width}" data-min-width="${column.minWidth}" data-max-width="${column.maxWidth}"${column.fill ? ' data-fill="1"' : ''} style="width:${column.width}px">`).join('')}</colgroup>
         <thead><tr>${columns.map(column => `<th class="tfs-resizable-col">${column.sortable ? `<button type="button" data-detail-sort="${column.key}">${this.escape(column.label)}</button>` : this.escape(column.label)}<span class="tfs-col-resizer" data-resize-col="${column.key}" title="拖动调整列宽"></span></th>`).join('')}</tr></thead>
         <tbody></tbody>
       </table>
@@ -599,6 +648,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     }
     this.bindDetailColumnResize(state)
     this.bindDetailContextMenu(terminal, state)
+    this.fillDetailTableWidth(state)
   }
 
   private bindDetailContextMenu (terminal: BaseTerminalTabComponent<any>, state: DetailModalState): void {
@@ -707,9 +757,12 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
         }
         const startX = event.clientX
         const startWidth = col.getBoundingClientRect().width || Number(col.style.width.replace('px', '')) || 220
+        const minWidth = Number(col.dataset.minWidth || 64)
+        const maxWidth = Number(col.dataset.maxWidth || 720)
         const move = (moveEvent: MouseEvent) => {
-          const width = Math.max(140, Math.min(720, Math.round(startWidth + moveEvent.clientX - startX)))
+          const width = Math.max(minWidth, Math.min(maxWidth, Math.round(startWidth + moveEvent.clientX - startX)))
           col.style.width = `${width}px`
+          this.updateDetailTableWidth(state)
         }
         const up = () => {
           window.removeEventListener('mousemove', move)
@@ -720,37 +773,100 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
         window.addEventListener('mousemove', move)
         window.addEventListener('mouseup', up)
       })
+      handle.addEventListener('dblclick', event => {
+        event.preventDefault()
+        event.stopPropagation()
+        const key = handle.dataset.resizeCol
+        const col = key ? state.body.querySelector<HTMLTableColElement>(`col[data-col="${key}"]`) : null
+        const width = Number(col?.dataset.defaultWidth || 0)
+        if (col && width > 0) {
+          col.style.width = `${width}px`
+          this.updateDetailTableWidth(state)
+        }
+      })
     }
   }
 
-  private getDetailColumns (kind: DetailKind): Array<{ key: string, label: string, sortable: boolean, width?: number }> {
+  private updateDetailTableWidth (state: DetailModalState): void {
+    const table = state.body.querySelector<HTMLTableElement>('.tfs-detail-table')
+    const cols = Array.from(state.body.querySelectorAll<HTMLTableColElement>('col[data-col]'))
+    if (!table || cols.length === 0) {
+      return
+    }
+
+    const width = this.getCurrentDetailColumnsWidth(cols)
+    table.style.width = `${Math.round(width)}px`
+  }
+
+  private fillDetailTableWidth (state: DetailModalState): void {
+    const table = state.body.querySelector<HTMLTableElement>('.tfs-detail-table')
+    const cols = Array.from(state.body.querySelectorAll<HTMLTableColElement>('col[data-col]'))
+    if (!table || cols.length === 0) {
+      return
+    }
+
+    let width = this.getCurrentDetailColumnsWidth(cols)
+    const targetWidth = state.body.clientWidth
+    const extra = targetWidth - width
+    if (extra > 0) {
+      const fillCols = cols.filter(col => col.dataset.fill === '1')
+      if (fillCols.length > 0) {
+        const perCol = extra / fillCols.length
+        for (const col of fillCols) {
+          const current = Number(col.style.width.replace('px', '')) || Number(col.dataset.defaultWidth || 0)
+          const maxWidth = Number(col.dataset.maxWidth || 1200)
+          const next = Math.min(maxWidth, current + perCol)
+          col.style.width = `${Math.round(next)}px`
+        }
+      }
+      width = this.getCurrentDetailColumnsWidth(cols)
+    }
+    table.style.width = `${Math.round(width)}px`
+  }
+
+  private getDetailColumnsWidth (columns: DetailColumn[]): number {
+    return columns.reduce((total, column) => total + column.width, 0)
+  }
+
+  private getCurrentDetailColumnsWidth (cols: HTMLTableColElement[]): number {
+    return cols.reduce((total, col) => total + (Number(col.style.width.replace('px', '')) || Number(col.dataset.defaultWidth || 0)), 0)
+  }
+
+  private getDetailColumns (kind: DetailKind): DetailColumn[] {
     if (kind === 'process') {
       return [
-        { key: 'pid', label: 'PID', sortable: true, width: 72 },
-        { key: 'user', label: '用户', sortable: true, width: 96 },
-        { key: 'mem', label: '内存', sortable: true, width: 72 },
-        { key: 'cpu', label: 'CPU', sortable: true, width: 72 },
-        { key: 'command', label: '命令', sortable: false, width: 260 },
-        { key: 'location', label: '位置', sortable: false, width: 320 },
+        { key: 'pid', label: 'PID', sortable: true, width: 88, minWidth: 64, maxWidth: 180 },
+        { key: 'user', label: '用户', sortable: true, width: 104, minWidth: 72, maxWidth: 220 },
+        { key: 'mem', label: '内存', sortable: true, width: 84, minWidth: 64, maxWidth: 160 },
+        { key: 'cpu', label: 'CPU', sortable: true, width: 84, minWidth: 64, maxWidth: 160 },
+        { key: 'command', label: '命令', sortable: false, width: 340, minWidth: 160, maxWidth: 1200, fill: true },
+        { key: 'location', label: '位置', sortable: false, width: 360, minWidth: 160, maxWidth: 1200, fill: true },
       ]
     }
     if (kind === 'network') {
       return [
-        { key: 'pid', label: 'PID', sortable: true, width: 72 },
-        { key: 'name', label: '名称', sortable: true, width: 130 },
-        { key: 'listenIp', label: '监听IP', sortable: true, width: 150 },
-        { key: 'port', label: '端口', sortable: true, width: 82 },
-        { key: 'ipCount', label: 'IP数', sortable: true, width: 76 },
-        { key: 'connCount', label: '连接数', sortable: true, width: 86 },
-        { key: 'upload', label: '上传', sortable: true, width: 92 },
-        { key: 'download', label: '下载', sortable: true, width: 92 },
+        { key: 'pid', label: 'PID', sortable: true, width: 82, minWidth: 64, maxWidth: 180 },
+        { key: 'name', label: '名称', sortable: true, width: 130, minWidth: 90, maxWidth: 720, fill: true },
+        { key: 'listenIp', label: '监听IP', sortable: true, width: 150, minWidth: 100, maxWidth: 720, fill: true },
+        { key: 'port', label: '端口', sortable: true, width: 82, minWidth: 64, maxWidth: 140 },
+        { key: 'ipCount', label: 'IP数', sortable: true, width: 76, minWidth: 64, maxWidth: 140 },
+        { key: 'connCount', label: '连接数', sortable: true, width: 86, minWidth: 70, maxWidth: 160 },
+        { key: 'upload', label: '上传', sortable: true, width: 92, minWidth: 76, maxWidth: 180 },
+        { key: 'download', label: '下载', sortable: true, width: 92, minWidth: 76, maxWidth: 180 },
       ]
     }
     return [
-      { key: 'ip', label: 'IP', sortable: false, width: 180 },
-      { key: 'latency', label: '延迟', sortable: false, width: 110 },
-      { key: 'loss', label: '丢包', sortable: false, width: 90 },
-      { key: 'location', label: '位置', sortable: false, width: 140 },
+      { key: 'hop', label: '跳数', sortable: false, width: 70, minWidth: 56, maxWidth: 110 },
+      { key: 'ip', label: 'IP', sortable: false, width: 160, minWidth: 120, maxWidth: 420 },
+      { key: 'ptr', label: 'PTR', sortable: false, width: 220, minWidth: 140, maxWidth: 720, fill: true },
+      { key: 'location', label: '地理位置 / 仅供参考', sortable: false, width: 180, minWidth: 140, maxWidth: 520, fill: true },
+      { key: 'asn', label: 'AS', sortable: false, width: 92, minWidth: 72, maxWidth: 160 },
+      { key: 'loss', label: '丢包率', sortable: false, width: 92, minWidth: 76, maxWidth: 150 },
+      { key: 'sent', label: '发包', sortable: false, width: 76, minWidth: 64, maxWidth: 120 },
+      { key: 'last', label: '最新(ms)', sortable: false, width: 96, minWidth: 80, maxWidth: 150 },
+      { key: 'best', label: '最快(ms)', sortable: false, width: 96, minWidth: 80, maxWidth: 150 },
+      { key: 'worst', label: '最慢(ms)', sortable: false, width: 96, minWidth: 80, maxWidth: 150 },
+      { key: 'avg', label: '平均(ms)', sortable: false, width: 96, minWidth: 80, maxWidth: 150 },
     ]
   }
 
@@ -832,12 +948,188 @@ fi
 
   private latencyDetailCollectorExecCommand (): string {
     const script = String.raw`target=1.1.1.1
-if command -v traceroute >/dev/null 2>&1; then
-  traceroute -n -w 1 -q 1 -m 12 "$target" 2>/dev/null | awk 'NR>1{hop=$1; ip=$2; if(ip=="*"||ip=="") {printf "ldetail\t*\t-\t100%%\t第%s跳\n", hop; next} lat=$3; loss="-"; if(lat=="*"||lat=="") lat="-"; else lat=sprintf("%.0fms", lat); printf "ldetail\t%s\t%s\t%s\t第%s跳\n", ip, lat, loss, hop}'
+ptr_lookup() {
+  ip="$1"
+  case "$ip" in ""|"-"|"*"|"--") printf -- "--"; return ;; esac
+  if command -v getent >/dev/null 2>&1; then
+    ptr=$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')
+    [ -n "$ptr" ] && { printf "%s" "$ptr"; return; }
+  fi
+  if command -v nslookup >/dev/null 2>&1; then
+    ptr=$(nslookup "$ip" 2>/dev/null | awk -F'= ' '/name =/{gsub(/\.$/,"",$2); print $2; exit}')
+    [ -n "$ptr" ] && { printf "%s" "$ptr"; return; }
+  fi
+  printf -- "--"
+}
+is_private_ip() {
+  case "$1" in
+    10.*|127.*|169.254.*|192.168.*) return 0 ;;
+    172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+geo_lookup() {
+  ip="$1"
+  case "$ip" in ""|"-"|"*"|"--") printf -- "--\t--"; return ;; esac
+  if is_private_ip "$ip"; then
+    printf "局域网\t--"
+    return
+  fi
+
+  tmpdir="$TMPDIR"
+  [ -z "$tmpdir" ] && tmpdir="/tmp"
+  cache="$tmpdir/tabby-status-ipgeo.tsv"
+  if [ -r "$cache" ]; then
+    cached=$(awk -F '\t' -v ip="$ip" '$1==ip{print $2 "\t" $3; exit}' "$cache" 2>/dev/null)
+    if [ -n "$cached" ]; then
+      printf "%s" "$cached"
+      return
+    fi
+  fi
+
+  location="--"; asn="--"
+  if command -v curl >/dev/null 2>&1; then
+    geo=$(curl -4 -fsS --connect-timeout 1 --max-time 1 "http://ip-api.com/line/$ip?fields=status,country,regionName,city,isp,as&lang=zh-CN" 2>/dev/null || true)
+    if [ -n "$geo" ]; then
+      status=$(printf "%s\n" "$geo" | awk 'NR==1{print}')
+      if [ "$status" = "success" ]; then
+        country=$(printf "%s\n" "$geo" | awk 'NR==2{print}')
+        region=$(printf "%s\n" "$geo" | awk 'NR==3{print}')
+        city=$(printf "%s\n" "$geo" | awk 'NR==4{print}')
+        isp=$(printf "%s\n" "$geo" | awk 'NR==5{print}')
+        asline=$(printf "%s\n" "$geo" | awk 'NR==6{print}')
+        location=$(printf "%s/%s/%s/%s" "$country" "$region" "$city" "$isp" | awk '{gsub(/\/+/, "/"); gsub(/^\/|\/$/, ""); print $0==""?"--":$0}')
+        asn=$(printf "%s" "$asline" | awk '{print $1}')
+        [ -z "$asn" ] && asn="--"
+      fi
+    fi
+  fi
+  printf "%s\t%s" "$location" "$asn"
+  [ "$location" = "--" ] && [ "$asn" = "--" ] || { mkdir -p "$(dirname "$cache")" 2>/dev/null; printf "%s\t%s\t%s\n" "$ip" "$location" "$asn" >> "$cache" 2>/dev/null; }
+}
+emit_row() {
+  hop="$1"; ip="$2"; loss="$3"; sent="$4"; last="$5"; best="$6"; worst="$7"; avg="$8"
+  [ -z "$ip" ] && ip="--"
+  [ "$ip" = "???" ] && ip="--"
+  [ "$ip" = "*" ] && ptr="--" || ptr=$(ptr_lookup "$ip")
+  geo=$(geo_lookup "$ip")
+  location=$(printf "%s" "$geo" | awk -F '\t' '{print $1}')
+  asn=$(printf "%s" "$geo" | awk -F '\t' '{print $2}')
+  [ -z "$loss" ] && loss="--"
+  [ -z "$sent" ] && sent="--"
+  [ -z "$last" ] && last="--"
+  [ -z "$best" ] && best="--"
+  [ -z "$worst" ] && worst="--"
+  [ -z "$avg" ] && avg="--"
+  [ -z "$location" ] && location="--"
+  [ -z "$asn" ] && asn="--"
+  printf "ldetail\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$hop" "$ip" "$ptr" "$location" "$asn" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+}
+if command -v mtr >/dev/null 2>&1; then
+  mtr -n -r -c 20 -i 0.2 -w -b "$target" 2>/dev/null | awk '
+    /^[[:space:]]*[0-9]+\./ {
+      hop=$1; gsub(/[^0-9]/,"",hop)
+      ip=$2
+      loss=$3
+      sent=$4
+      last=$5
+      avg=$6
+      best=$7
+      worst=$8
+      if(last=="") last="--"
+      if(avg=="") avg="--"
+      if(best=="") best="--"
+      if(worst=="") worst="--"
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", hop, ip, loss, sent, last, best, worst, avg
+    }' | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+      emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+    done
+elif command -v traceroute >/dev/null 2>&1; then
+  traceroute -n -w 1 -q 3 -m 16 "$target" 2>/dev/null | awk 'NR>1{
+    hop=$1; ip=$2
+    if(ip=="*"||ip=="") {printf "%s\t--\t100%%\t3\t*\t--\t--\t--\n", hop; next}
+    sent=3; count=0; sum=0; best=""; worst=""; last="*"
+    for(i=3;i<=NF;i++){
+      if($i ~ /^[0-9.]+$/ && $(i+1)=="ms"){
+        v=$i+0; count++; sum+=v; last=sprintf("%.0f", v)
+        if(best==""||v<best) best=v
+        if(worst==""||v>worst) worst=v
+      }
+    }
+    loss=sprintf("%.0f%%", (sent-count)*100/sent)
+    avg=count?sprintf("%.0f", sum/count):"--"
+    best=count?sprintf("%.0f", best):"--"
+    worst=count?sprintf("%.0f", worst):"--"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", hop, ip, loss, sent, last, best, worst, avg
+  }' | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+    emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+  done
 elif command -v tracepath >/dev/null 2>&1; then
-  tracepath -n -m 12 "$target" 2>/dev/null | awk '{hop=$1; ip=$2; lat="-"; for(i=1;i<=NF;i++){if($i=="ms"){lat=sprintf("%.0fms", $(i-1))}} if(hop ~ /^[0-9]+:/){gsub(":","",hop); if(ip=="no") ip="*"; printf "ldetail\t%s\t%s\t%s\t第%s跳\n", ip, lat, ip=="*"?"100%":"-", hop}}'
+  tracepath -n -m 16 "$target" 2>/dev/null | awk '{
+    hop=$1; ip=$2; lat="--"
+    for(i=1;i<=NF;i++){ if($i=="ms"){ lat=sprintf("%.0f", $(i-1)) } }
+    if(hop ~ /^[0-9]+:/){
+      gsub(":","",hop); if(ip=="no") ip="--"
+      printf "%s\t%s\t%s\t1\t%s\t%s\t%s\t%s\n", hop, ip, ip=="--"?"100%":"0%", lat=="--"?"*":lat, lat, lat, lat
+    }
+  }' | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+    emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+  done
 else
-  ping -c 4 -W 1 "$target" 2>/dev/null | awk -v target="$target" -F', ' '/packet loss/{loss=$3} /min\/avg\/max/{split($4,a,"/"); lat=sprintf("%.0fms", a[2])} END{if(loss=="") loss="100%"; if(lat=="") lat="-"; printf "ldetail\t%s\t%s\t%s\t目标\n", target, lat, loss}'
+  ttl=1
+  while [ "$ttl" -le 16 ]; do
+    row=$(ping -c 1 -W 1 -t "$ttl" "$target" 2>/dev/null | awk -v ttl="$ttl" -v target="$target" '
+      BEGIN { ip="--"; sent=1; received=0; last="*"; best="--"; worst="--"; avg="--"; reached=0 }
+      /From / {
+        for(i=1;i<=NF;i++){
+          if($i=="From" && i<NF){ ip=$(i+1); gsub(/:$/,"",ip) }
+        }
+        received=1
+      }
+      / bytes from / {
+        for(i=1;i<=NF;i++){
+          if($i=="from" && i<NF){ ip=$(i+1); gsub(/:$/,"",ip); reached=1 }
+        }
+      }
+      {
+        for(i=1;i<=NF;i++){
+          if($i ~ /^time[=<]/){
+            value=$i
+            sub(/^time[=<]/, "", value)
+            sub(/ms$/, "", value)
+            if(value=="") next
+            received=1
+            if($i ~ /^time</){
+              last="<1"; best="<1"; worst="<1"; avg="<1"
+            } else {
+              last=sprintf("%.0f", value+0)
+              best=last; worst=last; avg=last
+            }
+          }
+        }
+      }
+      /packets transmitted/ {
+        sent=$1
+        for(i=1;i<=NF;i++){
+          if($i=="received," && i>1) received=$(i-1)+0
+          if($i=="received" && i>1) received=$(i-1)+0
+        }
+      }
+      END {
+        if(ip=="--" && received==0) {
+          printf "%s\t--\t100%%\t%s\t*\t--\t--\t--\t0\n", ttl, sent
+        } else {
+          loss=sprintf("%.0f%%", sent>0 ? (sent-received)*100/sent : 0)
+          printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", ttl, ip, loss, sent, last, best, worst, avg, reached
+        }
+      }')
+    IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg reached <<EOF
+$row
+EOF
+    emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+    [ "$reached" = "1" ] && break
+    ttl=$((ttl + 1))
+  done
 fi
 `
     return this.encodeShellScript(script)
@@ -886,10 +1178,17 @@ fi
     const rows = this.parseLatencyDetails(text)
     body.innerHTML = rows.map(row => `
       <tr>
+        <td>${this.escape(row.hop)}</td>
         <td>${this.escape(row.ip)}</td>
-        <td>${this.escape(row.latency)}</td>
-        <td>${this.escape(row.loss)}</td>
+        <td title="${this.escape(row.ptr)}">${this.escape(row.ptr)}</td>
         <td>${this.escape(row.location)}</td>
+        <td>${this.escape(row.asn)}</td>
+        <td>${this.escape(row.loss)}</td>
+        <td>${this.escape(row.sent)}</td>
+        <td>${this.escape(row.last)}</td>
+        <td>${this.escape(row.best)}</td>
+        <td>${this.escape(row.worst)}</td>
+        <td>${this.escape(row.avg)}</td>
       </tr>
     `).join('')
   }
@@ -951,10 +1250,17 @@ fi
 
   private parseLatencyDetails (text: string): LatencyDetailRow[] {
     return text.split(/\r?\n/).filter(Boolean).map(line => line.split('\t')).filter(parts => parts[0] === 'ldetail').map(parts => ({
-      ip: parts[1] || '-',
-      latency: parts[2] || '-',
-      loss: parts[3] || '-',
-      location: parts[4] || '-',
+      hop: parts[1] || '-',
+      ip: parts[2] || '--',
+      ptr: parts[3] || '--',
+      location: parts[4] || '--',
+      asn: parts[5] || '--',
+      loss: parts[6] || '--',
+      sent: parts[7] || '--',
+      last: parts[8] || '--',
+      best: parts[9] || '--',
+      worst: parts[10] || '--',
+      avg: parts[11] || '--',
     }))
   }
 
@@ -997,15 +1303,17 @@ fi
   }
 
   private mountPanel (terminal: BaseTerminalTabComponent<any>, panel: HTMLElement): void {
-    const host = terminal.element?.nativeElement ?? document.body
-    host.classList.add('tabby-status-host')
-    this.setPanelWidth(host, this.getSavedPanelWidth())
-    host.appendChild(panel)
-    this.hosts.set(terminal, host)
-    this.bindPanelResize(host, panel)
+    const terminalElement = terminal.element?.nativeElement ?? document.body
+    const layoutHost = terminalElement.parentElement ?? terminalElement
+    layoutHost.classList.add('tabby-status-layout')
+    this.setPanelWidth(layoutHost, this.getSavedPanelWidth())
+    layoutHost.appendChild(panel)
+    this.hosts.set(terminal, layoutHost)
+    this.bindPanelResize(terminal, layoutHost, panel)
+    this.scheduleTerminalResize(terminal)
   }
 
-  private bindPanelResize (host: HTMLElement, panel: HTMLElement): void {
+  private bindPanelResize (terminal: BaseTerminalTabComponent<any>, host: HTMLElement, panel: HTMLElement): void {
     const handle = panel.querySelector('.tfs-resizer') as HTMLElement | null
     if (!handle) {
       return
@@ -1017,6 +1325,7 @@ fi
     const move = (event: MouseEvent) => {
       const nextWidth = this.clampPanelWidth(startWidth + event.clientX - startX)
       this.setPanelWidth(host, nextWidth)
+      this.scheduleTerminalResize(terminal)
     }
     const up = () => {
       window.removeEventListener('mousemove', move)
@@ -1024,6 +1333,7 @@ fi
       document.body.classList.remove('tfs-resizing')
       const width = this.readPanelWidth(host)
       window.localStorage?.setItem(this.panelWidthStorageKey, String(width))
+      this.scheduleTerminalResize(terminal)
     }
 
     handle.addEventListener('mousedown', event => {
@@ -1046,6 +1356,19 @@ fi
 
   private setPanelWidth (host: HTMLElement, width: number): void {
     host.style.setProperty('--tfs-panel-width', `${this.clampPanelWidth(width)}px`)
+  }
+
+  private scheduleTerminalResize (terminal: BaseTerminalTabComponent<any>): void {
+    const resize = () => {
+      const frontend = terminal.frontend as any
+      if (typeof frontend?.resizeHandler === 'function') {
+        frontend.resizeHandler()
+        return
+      }
+      window.dispatchEvent(new Event('resize'))
+    }
+    window.requestAnimationFrame(resize)
+    window.setTimeout(resize, 80)
   }
 
   private clampPanelWidth (width: number): number {
@@ -1366,8 +1689,8 @@ fi
   }
 
   private setMeterData (panel: HTMLElement, key: string, percent: string, detail = '', disabled = false): void {
-    this.setData(panel, `${key}-pct`, percent)
-    this.setData(panel, `${key}-detail`, detail)
+    this.setData(panel, `${key}-pct`, detail ? `${percent} · ${detail}` : percent)
+    this.setData(panel, `${key}-detail`, '')
     const value = panel.querySelector(`[data-meter="${key}"]`)
     value?.classList.toggle('tfs-disabled-value', disabled)
     value?.classList.toggle('tfs-meter-no-detail', !detail)
@@ -1410,11 +1733,13 @@ fi
     const style = document.createElement('style')
     style.id = 'tabby-status-style'
     style.textContent = `
-      .tabby-status-host {
+      .tabby-status-layout {
         position: relative !important;
         box-sizing: border-box !important;
         --tfs-panel-width: 320px;
-        padding-left: var(--tfs-panel-width) !important;
+        --tfs-content-margin: max(0px, 30px * var(--spaciness) - 15px);
+        transition: none !important;
+        animation: none !important;
       }
       .tabby-status {
         position: absolute;
@@ -1432,6 +1757,13 @@ fi
         line-height: 1.28;
         box-sizing: border-box;
         scrollbar-width: none;
+      }
+      .tabby-status-layout .content {
+        margin: var(--tfs-content-margin) var(--tfs-content-margin) var(--tfs-content-margin) calc(var(--tfs-panel-width) + var(--tfs-content-margin)) !important;
+      }
+      .tabby-status-layout sftp-panel {
+        left: var(--tfs-panel-width) !important;
+        width: calc(100% - var(--tfs-panel-width)) !important;
       }
       .tabby-status::-webkit-scrollbar { display: none; }
       .tfs-resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: ew-resize; z-index: 30; }
@@ -1467,16 +1799,16 @@ fi
       .tfs-kv span, .tfs-meter span { color: #91a0a5; }
       .tfs-kv span { width: 34px; }
       .tfs-kv b { font-weight: 500; color: #edf3f5; }
-      .tfs-meter { display: grid; grid-template-columns: 42px minmax(148px, 1fr) max-content; align-items: center; column-gap: 8px; padding: 3px 10px; }
+      .tfs-meter { display: grid; grid-template-columns: 42px minmax(0, 1fr); align-items: center; column-gap: 8px; padding: 3px 10px; }
       .tfs-meter span { overflow: hidden; text-overflow: ellipsis; }
-      .tfs-meter i { position: relative; flex: 1; height: 8px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
-      .tfs-meter em { display: block; height: 100%; background: linear-gradient(90deg, #5fb3ff, #31c66b); opacity: .95; }
-      .tfs-meter b { text-align: left; color: rgba(215,222,224,.62); font-weight: 500; font-size: 11px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .tfs-meter-value { display: inline-flex; align-items: center; gap: 10px; }
-      .tfs-meter-value span:first-child { text-align: left; }
-      .tfs-meter-value span:last-child { text-align: left; overflow: hidden; text-overflow: ellipsis; }
-      .tfs-meter-value.tfs-meter-no-detail span:last-child { display: none; }
-      .tfs-meter b.tfs-disabled-value { color: rgba(215,222,224,.48); font-weight: 500; }
+      .tfs-meter i { position: relative; height: 15px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
+      .tfs-meter em { position: absolute; inset: 0 auto 0 0; display: block; height: 100%; background: linear-gradient(90deg, #5fb3ff, #31c66b); opacity: .95; }
+      .tfs-meter b { text-align: right; color: #edf3f5; font-weight: 700; font-size: 11px; line-height: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tfs-meter-value { position: absolute; inset: 0 8px 0 8px; z-index: 1; display: grid; grid-template-columns: 1fr; align-items: center; text-shadow: 0 1px 1px rgba(0,0,0,.9), 0 0 3px rgba(0,0,0,.85); }
+      .tfs-meter-value span:first-child { text-align: right; }
+      .tfs-meter-value span:last-child { display: none; text-align: right; overflow: hidden; text-overflow: ellipsis; }
+      .tfs-meter-value.tfs-meter-no-detail { grid-template-columns: 1fr; }
+      .tfs-meter b.tfs-disabled-value { color: rgba(215,222,224,.58); font-weight: 600; }
       .tfs-section { margin: 10px 10px 5px; color: #7fc8ff; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }
       .tfs-clickable { cursor: pointer; }
       .tfs-clickable:hover { background: rgba(127,200,255,.06); }
@@ -1501,14 +1833,14 @@ fi
       .tfs-chart b { font-weight: 700; color: #4fd17f; font-size: 12px; }
       .tfs-chart b:first-child { color: #ff8b65; }
       .tfs-chart strong { font-weight: 500; color: #d7dee0; overflow: hidden; text-overflow: ellipsis; text-align: right; }
-      .tfs-chart p { height: 12px; margin: 0 0 0 42px; border-top: 1px dotted rgba(255,255,255,.18); }
-      .tfs-net-bars { height: 38px; margin: 5px 0 2px 42px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
+      .tfs-chart p { height: 12px; margin: 0; border-top: 1px dotted rgba(255,255,255,.18); }
+      .tfs-net-bars { height: 38px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
       .tfs-net-bars span { height: 30px; display: flex; align-items: end; justify-content: center; gap: 1px; }
       .tfs-net-bars i { width: 3px; min-height: 2px; border-radius: 2px 2px 0 0; opacity: .9; }
       .tfs-net-bars .tx { background: #ff8b65; }
       .tfs-net-bars .rx { background: #4fd17f; }
       .tfs-lat b:first-child { color: #7fc8ff; }
-      .tfs-latency-bars { height: 34px; margin: 5px 0 2px 42px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
+      .tfs-latency-bars { height: 34px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
       .tfs-latency-bars span { display: block; min-height: 2px; border-radius: 2px 2px 0 0; background: #7fc8ff; opacity: .9; }
       .tfs-idle { opacity: .42; }
       .tabby-status table { width: calc(100% - 20px); margin: 0 10px 10px; border-collapse: collapse; table-layout: fixed; }
@@ -1523,15 +1855,25 @@ fi
       .tfs-detail-backdrop { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: rgba(8,12,14,.58); }
       .tfs-detail-dialog { width: min(980px, calc(100vw - 56px)); height: min(680px, calc(100vh - 56px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(127,200,255,.22); background: #1f272a; color: #d7dee0; box-shadow: 0 18px 60px rgba(0,0,0,.42); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; }
       .tfs-detail-top { display: grid; grid-template-columns: max-content 1fr max-content; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.1); }
+      .tfs-detail-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
       .tfs-detail-top strong { font-size: 14px; color: #edf3f5; }
       .tfs-detail-top span { color: #8ea1a7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
       .tfs-detail-top button { border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: #d7dee0; padding: 4px 10px; font: inherit; cursor: pointer; }
+      .tfs-detail-top .tfs-detail-icon-button { width: 18px; height: 18px; display: inline-grid; place-items: center; padding: 0; border-radius: 4px; background: transparent; }
+      .tfs-detail-pause-icon { width: 10px; height: 10px; position: relative; display: block; }
+      .tfs-detail-pause-icon::before,
+      .tfs-detail-pause-icon::after { content: ""; position: absolute; top: 1px; bottom: 1px; width: 3px; border-radius: 1px; background: currentColor; }
+      .tfs-detail-pause-icon::before { left: 1px; }
+      .tfs-detail-pause-icon::after { right: 1px; }
+      .tfs-detail-top button.tfs-detail-paused { border-color: rgba(127,200,255,.34); background: rgba(127,200,255,.1); color: #edf3f5; }
+      .tfs-detail-top button.tfs-detail-paused .tfs-detail-pause-icon::before { top: 1px; left: 3px; bottom: auto; width: 0; height: 0; border-radius: 0; background: transparent; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 7px solid currentColor; }
+      .tfs-detail-top button.tfs-detail-paused .tfs-detail-pause-icon::after { display: none; }
       .tfs-detail-body { flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: rgba(127,200,255,.42) rgba(255,255,255,.06); }
       .tfs-detail-body::-webkit-scrollbar { width: 8px; height: 8px; }
       .tfs-detail-body::-webkit-scrollbar-track { background: rgba(255,255,255,.06); }
       .tfs-detail-body::-webkit-scrollbar-thumb { background: rgba(127,200,255,.42); border-radius: 8px; }
       .tfs-detail-body::-webkit-scrollbar-thumb:hover { background: rgba(127,200,255,.62); }
-      .tfs-detail-table { width: max-content; min-width: 100%; border-collapse: collapse; table-layout: fixed; }
+      .tfs-detail-table { border-collapse: collapse; table-layout: fixed; }
       .tfs-detail-table th, .tfs-detail-table td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,.07); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
       .tfs-detail-table th { position: sticky; top: 0; z-index: 1; background: #232c2f; color: #8ea1a7; font-weight: 600; }
       .tfs-detail-table th.tfs-resizable-col { position: sticky; }
