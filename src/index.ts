@@ -2,6 +2,8 @@ import { Injectable, NgModule } from '@angular/core'
 import TabbyCoreModule from 'tabby-core'
 import { TerminalDecorator, BaseTerminalTabComponent } from 'tabby-terminal'
 
+declare const __non_webpack_require__: any
+
 type DiskRow = {
   path: string
   used: string
@@ -271,7 +273,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     const sshSession = (terminal as any).sshSession ?? (terminal.session as any)?.ssh
     const ssh = sshSession?.ssh
     if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
-      this.setStatus(panel, kind, '等待 SSH')
+      this.setData(panel, 'status', '')
       return
     }
 
@@ -568,13 +570,17 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     const sshSession = (terminal as any).sshSession ?? (terminal.session as any)?.ssh
     const ssh = sshSession?.ssh
     if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
-      state.status.textContent = '等待 SSH'
-      return
+      if (state.kind !== 'latency') {
+        state.status.textContent = '等待 SSH'
+        return
+      }
     }
 
     state.inflight = true
     try {
-      const text = await this.runSshExec(ssh, this.detailCollectorExecCommand(state.kind), state.kind === 'latency' ? 30000 : 8000)
+      const text = state.kind === 'latency'
+        ? await this.collectLatencyDetails(terminal, ssh)
+        : await this.runSshExec(ssh, this.detailCollectorExecCommand(terminal, state.kind), 8000)
       if (this.detailModals.get(terminal) !== state) {
         return
       }
@@ -870,14 +876,88 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     ]
   }
 
-  private detailCollectorExecCommand (kind: DetailKind): string {
+  private detailCollectorExecCommand (terminal: BaseTerminalTabComponent<any>, kind: DetailKind): string {
     if (kind === 'process') {
       return this.processDetailCollectorExecCommand()
     }
     if (kind === 'network') {
       return this.networkDetailCollectorExecCommand()
     }
-    return this.latencyDetailCollectorExecCommand()
+    return this.latencyDetailCollectorExecCommand(this.getLatencyTraceTarget(terminal))
+  }
+
+  private async collectLatencyDetails (terminal: BaseTerminalTabComponent<any>, ssh: any): Promise<string> {
+    const target = this.getLatencyTraceTarget(terminal)
+    if (target !== this.defaultLatencyTraceTarget()) {
+      try {
+        const local = await this.runLocalCommand('/bin/sh', ['-lc', this.localLatencyDetailScript(target)], 30000)
+        if (local.trim()) {
+          return local
+        }
+      } catch (error) {
+        console.warn('[tabby-status] local traceroute failed, falling back to SSH', error)
+      }
+    }
+    if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
+      throw new Error('等待 SSH')
+    }
+    return this.runSshExec(ssh, this.latencyDetailCollectorExecCommand(target), 30000)
+  }
+
+  private async runLocalCommand (app: string, argv: string[], timeoutMs = 8000): Promise<string> {
+    const requireFn = typeof __non_webpack_require__ === 'function' ? __non_webpack_require__ : (globalThis as any).require
+    if (!requireFn) {
+      throw new Error('local command API unavailable')
+    }
+    const childProcess = requireFn('child_process')
+    return new Promise<string>((resolve, reject) => {
+      const child = childProcess.execFile(app, argv, { timeout: timeoutMs, maxBuffer: 1024 * 1024 }, (error: Error | null, stdout: string, stderr: string) => {
+        if (error && !stdout) {
+          reject(new Error(stderr?.trim() || error.message))
+          return
+        }
+        resolve(stdout || '')
+      })
+      child.on?.('error', reject)
+    })
+  }
+
+  private getLatencyTraceTarget (terminal: BaseTerminalTabComponent<any>): string {
+    const sources = [
+      (terminal as any).profile?.options,
+      (terminal as any).profile,
+      (terminal as any).sshSession,
+      (terminal.session as any)?.ssh,
+      terminal.session,
+    ]
+    const keys = ['host', 'hostname', 'address', 'destination', 'target']
+    for (const source of sources) {
+      if (!source || typeof source !== 'object') {
+        continue
+      }
+      for (const key of keys) {
+        const value = source[key]
+        if (this.isTraceTarget(value)) {
+          return String(value).trim()
+        }
+      }
+    }
+    return this.defaultLatencyTraceTarget()
+  }
+
+  private defaultLatencyTraceTarget (): string {
+    return '1.1.1.1'
+  }
+
+  private isTraceTarget (value: unknown): boolean {
+    if (typeof value !== 'string') {
+      return false
+    }
+    const target = value.trim()
+    if (!target || target.includes('\n') || target.includes('\r') || target.startsWith('-')) {
+      return false
+    }
+    return /^[A-Za-z0-9.:-]+$/.test(target)
   }
 
   private processDetailCollectorExecCommand (): string {
@@ -946,8 +1026,107 @@ fi
     return this.encodeShellScript(script)
   }
 
-  private latencyDetailCollectorExecCommand (): string {
-    const script = String.raw`target=1.1.1.1
+  private localLatencyDetailScript (target: string): string {
+    const safeTarget = this.shellQuote(this.isTraceTarget(target) ? target : this.defaultLatencyTraceTarget())
+    return String.raw`target=__TABBY_STATUS_TRACE_TARGET__
+is_private_ip() {
+  case "$1" in
+    10.*|127.*|169.254.*|192.168.*) return 0 ;;
+    172.16.*|172.17.*|172.18.*|172.19.*|172.20.*|172.21.*|172.22.*|172.23.*|172.24.*|172.25.*|172.26.*|172.27.*|172.28.*|172.29.*|172.30.*|172.31.*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+geo_lookup() {
+  ip="$1"
+  case "$ip" in ""|"-"|"*"|"--") printf -- "--\t--"; return ;; esac
+  if is_private_ip "$ip"; then
+    printf "局域网\t--"
+    return
+  fi
+  location="--"; asn="--"
+  if command -v curl >/dev/null 2>&1; then
+    geo=$(curl -4 -fsS --connect-timeout 1 --max-time 1 "http://ip-api.com/line/$ip?fields=status,country,regionName,city,isp,as&lang=zh-CN" 2>/dev/null || true)
+    if [ -n "$geo" ] && [ "$(printf "%s\n" "$geo" | awk 'NR==1{print}')" = "success" ]; then
+      country=$(printf "%s\n" "$geo" | awk 'NR==2{print}')
+      region=$(printf "%s\n" "$geo" | awk 'NR==3{print}')
+      city=$(printf "%s\n" "$geo" | awk 'NR==4{print}')
+      isp=$(printf "%s\n" "$geo" | awk 'NR==5{print}')
+      asline=$(printf "%s\n" "$geo" | awk 'NR==6{print}')
+      location=$(printf "%s/%s/%s/%s" "$country" "$region" "$city" "$isp" | awk '{gsub(/\/+/, "/"); gsub(/^\/|\/$/, ""); print $0==""?"--":$0}')
+      asn=$(printf "%s" "$asline" | awk '{print $1}')
+      [ -z "$asn" ] && asn="--"
+    fi
+  fi
+  printf "%s\t%s" "$location" "$asn"
+}
+emit_row() {
+  hop="$1"; ip="$2"; loss="$3"; sent="$4"; last="$5"; best="$6"; worst="$7"; avg="$8"
+  geo=$(geo_lookup "$ip")
+  location=$(printf "%s" "$geo" | awk -F '\t' '{print $1}')
+  asn=$(printf "%s" "$geo" | awk -F '\t' '{print $2}')
+  [ -z "$ip" ] && ip="--"
+  [ -z "$location" ] && location="--"
+  [ -z "$asn" ] && asn="--"
+  printf "ldetail\t%s\t%s\t--\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$hop" "$ip" "$location" "$asn" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+}
+if command -v traceroute >/dev/null 2>&1; then
+  traceroute -n -w 1 -q 3 -m 24 "$target" 2>/dev/null | awk 'NR>1{
+    hop=$1; ip=$2
+    if(ip=="*"||ip=="") {printf "%s\t--\t100%%\t3\t*\t--\t--\t--\n", hop; next}
+    sent=3; count=0; sum=0; best=""; worst=""; last="*"
+    for(i=3;i<=NF;i++){
+      if($i ~ /^[0-9.]+$/ && $(i+1)=="ms"){
+        v=$i+0; count++; sum+=v; last=sprintf("%.0f", v)
+        if(best==""||v<best) best=v
+        if(worst==""||v>worst) worst=v
+      }
+    }
+    loss=sprintf("%.0f%%", (sent-count)*100/sent)
+    avg=count?sprintf("%.0f", sum/count):"--"
+    best=count?sprintf("%.0f", best):"--"
+    worst=count?sprintf("%.0f", worst):"--"
+    printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", hop, ip, loss, sent, last, best, worst, avg
+  }' | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+    emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+  done
+fi
+`.replace('__TABBY_STATUS_TRACE_TARGET__', safeTarget)
+  }
+
+  private latencyDetailCollectorExecCommand (target: string): string {
+    const fallbackTarget = this.defaultLatencyTraceTarget()
+    const safeTarget = this.shellQuote(this.isTraceTarget(target) ? target : fallbackTarget)
+    const safeFallbackTarget = this.shellQuote(fallbackTarget)
+    const script = String.raw`target=__TABBY_STATUS_TRACE_TARGET__
+fallback_target=__TABBY_STATUS_FALLBACK_TRACE_TARGET__
+resolve_target_ip() {
+  value="$1"
+  case "$value" in
+    *[!0-9.]*|"") ;;
+    *.*) printf "%s" "$value"; return ;;
+  esac
+  if command -v getent >/dev/null 2>&1; then
+    resolved=$(getent ahostsv4 "$value" 2>/dev/null | awk '{print $1; exit}')
+    [ -n "$resolved" ] && { printf "%s" "$resolved"; return; }
+  fi
+  if command -v nslookup >/dev/null 2>&1; then
+    resolved=$(nslookup "$value" 2>/dev/null | awk '/^Address: /{print $2; exit}')
+    [ -n "$resolved" ] && { printf "%s" "$resolved"; return; }
+  fi
+  printf "%s" "$value"
+}
+is_local_trace_target() {
+  ip="$1"
+  [ -z "$ip" ] && return 1
+  for local_ip in $(hostname -I 2>/dev/null; ip -o -4 addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'); do
+    [ "$ip" = "$local_ip" ] && return 0
+  done
+  return 1
+}
+target_ip=$(resolve_target_ip "$target")
+if is_local_trace_target "$target_ip"; then
+  target="$fallback_target"
+fi
 ptr_lookup() {
   ip="$1"
   case "$ip" in ""|"-"|"*"|"--") printf -- "--"; return ;; esac
@@ -1066,13 +1245,58 @@ elif command -v traceroute >/dev/null 2>&1; then
   done
 elif command -v tracepath >/dev/null 2>&1; then
   tracepath -n -m 16 "$target" 2>/dev/null | awk '{
-    hop=$1; ip=$2; lat="--"
-    for(i=1;i<=NF;i++){ if($i=="ms"){ lat=sprintf("%.0f", $(i-1)) } }
+    hop=$1; ip=$2
     if(hop ~ /^[0-9]+:/){
-      gsub(":","",hop); if(ip=="no") ip="--"
-      printf "%s\t%s\t%s\t1\t%s\t%s\t%s\t%s\n", hop, ip, ip=="--"?"100%":"0%", lat=="--"?"*":lat, lat, lat, lat
+      gsub(":","",hop)
+      if(ip=="no" || ip=="") ip="--"
+      printf "%s\t%s\n", hop, ip
     }
-  }' | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+  }' | while IFS="$(printf '\t')" read -r hop ip; do
+    if [ "$ip" = "--" ]; then
+      printf "%s\t--\t100%%\t3\t*\t--\t--\t--\n" "$hop"
+      continue
+    fi
+    ping -c 3 -W 1 "$ip" 2>/dev/null | awk -v hop="$hop" -v ip="$ip" '
+      BEGIN { sent=3; received=0; loss="100%"; last="*"; best="--"; worst="--"; avg="--" }
+      /bytes from/ {
+        received++
+        for(i=1;i<=NF;i++){
+          if($i ~ /^time[=<]/){
+            value=$i
+            sub(/^time[=<]/, "", value)
+            sub(/ms$/, "", value)
+            if(value=="") next
+            if($i ~ /^time</){
+              last="<1"; if(best=="--") best="<1"; worst="<1"
+            } else {
+              v=value+0
+              last=sprintf("%.0f", v)
+              sum+=v
+              if(best=="--"||v<best) best=v
+              if(worst=="--"||v>worst) worst=v
+            }
+          }
+        }
+      }
+      /packets transmitted/ {
+        sent=$1
+        for(i=1;i<=NF;i++){
+          if($i=="received," && i>1) received=$(i-1)+0
+          if($i=="received" && i>1) received=$(i-1)+0
+        }
+      }
+      END {
+        loss=sprintf("%.0f%%", sent>0 ? (sent-received)*100/sent : 0)
+        if(received>0 && best!="<1"){
+          avg=sprintf("%.0f", sum/received)
+          best=sprintf("%.0f", best)
+          worst=sprintf("%.0f", worst)
+        } else if(received>0) {
+          avg="<1"; best="<1"; worst="<1"
+        }
+        printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", hop, ip, loss, sent, last, best, worst, avg
+      }'
+  done | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
     emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
   done
 else
@@ -1132,7 +1356,9 @@ EOF
   done
 fi
 `
-    return this.encodeShellScript(script)
+    return this.encodeShellScript(script
+      .replace('__TABBY_STATUS_TRACE_TARGET__', safeTarget)
+      .replace('__TABBY_STATUS_FALLBACK_TRACE_TARGET__', safeFallbackTarget))
   }
 
   private renderDetailRows (terminal: BaseTerminalTabComponent<any>, state: DetailModalState, text: string): void {
@@ -1725,6 +1951,10 @@ fi
     }[c] ?? c))
   }
 
+  private shellQuote (value: string): string {
+    return `'${String(value).replace(/'/g, "'\\''")}'`
+  }
+
   private injectStyles (): void {
     if (document.getElementById('tabby-status-style')) {
       return
@@ -1738,6 +1968,7 @@ fi
         box-sizing: border-box !important;
         --tfs-panel-width: 320px;
         --tfs-content-margin: max(0px, 30px * var(--spaciness) - 15px);
+        --tfs-text-primary: #d7dee0;
         transition: none !important;
         animation: none !important;
       }
@@ -1750,7 +1981,7 @@ fi
         z-index: 20;
         overflow: auto;
         background: #1f272a;
-        color: #d7dee0;
+        color: var(--tfs-text-primary);
         border-left: 1px solid rgba(255,255,255,.12);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
         font-size: 13px;
@@ -1803,12 +2034,12 @@ fi
       .tfs-meter span { overflow: hidden; text-overflow: ellipsis; }
       .tfs-meter i { position: relative; height: 15px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
       .tfs-meter em { position: absolute; inset: 0 auto 0 0; display: block; height: 100%; background: linear-gradient(90deg, #5fb3ff, #31c66b); opacity: .95; }
-      .tfs-meter b { text-align: right; color: #edf3f5; font-weight: 700; font-size: 11px; line-height: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .tfs-meter-value { position: absolute; inset: 0 8px 0 8px; z-index: 1; display: grid; grid-template-columns: 1fr; align-items: center; text-shadow: 0 1px 1px rgba(0,0,0,.9), 0 0 3px rgba(0,0,0,.85); }
-      .tfs-meter-value span:first-child { text-align: right; }
+      .tfs-meter b { text-align: right; color: var(--tfs-text-primary) !important; opacity: 1; font-weight: 600; font-size: 11px; line-height: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tfs-meter-value { position: absolute; inset: 0 8px 0 8px; z-index: 1; display: grid; grid-template-columns: 1fr; align-items: center; color: var(--tfs-text-primary) !important; opacity: 1; text-shadow: none; }
+      .tfs-meter-value span:first-child { text-align: right; color: var(--tfs-text-primary) !important; opacity: 1; }
       .tfs-meter-value span:last-child { display: none; text-align: right; overflow: hidden; text-overflow: ellipsis; }
       .tfs-meter-value.tfs-meter-no-detail { grid-template-columns: 1fr; }
-      .tfs-meter b.tfs-disabled-value { color: rgba(215,222,224,.58); font-weight: 600; }
+      .tfs-meter b.tfs-disabled-value { color: var(--tfs-text-primary) !important; opacity: 1; font-weight: 600; }
       .tfs-section { margin: 10px 10px 5px; color: #7fc8ff; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }
       .tfs-clickable { cursor: pointer; }
       .tfs-clickable:hover { background: rgba(127,200,255,.06); }
@@ -1816,7 +2047,7 @@ fi
       .tfs-tabs { display: grid; grid-template-columns: var(--tfs-proc-columns); column-gap: 8px; color: #8ea1a7; border-top: 1px solid rgba(255,255,255,.08); border-bottom: 1px solid rgba(255,255,255,.08); margin: 0 10px; }
       .tfs-tabs button, .tfs-tabs span { padding: 4px 0; font-size: 11px; text-align: left; min-width: 0; }
       .tfs-tabs button { border: 0; background: transparent; color: inherit; font-family: inherit; font-size: 11px; line-height: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
-      .tfs-tabs button:hover, .tfs-tabs button.tfs-sort-active { color: #d7dee0; }
+      .tfs-tabs button:hover, .tfs-tabs button.tfs-sort-active { color: var(--tfs-text-primary); }
       .tfs-tabs button.tfs-sort-active { font-weight: 700; }
       .tfs-tabs button[data-dir="desc"]::after { content: "↓"; color: #7fc8ff; font-size: 10px; }
       .tfs-tabs button[data-dir="asc"]::after { content: "↑"; color: #7fc8ff; font-size: 10px; }
@@ -1824,7 +2055,7 @@ fi
       .tfs-processes { height: 110px; overflow-y: auto; overflow-x: hidden; font-size: 12px; margin: 0 10px; scrollbar-width: none; }
       .tfs-processes::-webkit-scrollbar { display: none; }
       .tfs-processes div { display: grid; grid-template-columns: var(--tfs-proc-columns); padding: 3px 0; white-space: nowrap; overflow: hidden; border-bottom: 1px solid rgba(255,255,255,.05); column-gap: 8px; }
-      .tfs-processes span { overflow: hidden; text-overflow: ellipsis; min-width: 0; }
+      .tfs-processes span { overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--tfs-text-primary); opacity: 1; }
       .tfs-processes span:nth-child(1), .tfs-processes span:nth-child(2) { font-variant-numeric: tabular-nums; }
       .tfs-chart { padding: 4px 10px; border-bottom: 1px solid rgba(255,255,255,.08); }
       .tfs-chart-head { display: grid; align-items: center; gap: 12px; overflow: hidden; }
@@ -1832,7 +2063,7 @@ fi
       .tfs-lat-head { grid-template-columns: max-content minmax(64px, 1fr); }
       .tfs-chart b { font-weight: 700; color: #4fd17f; font-size: 12px; }
       .tfs-chart b:first-child { color: #ff8b65; }
-      .tfs-chart strong { font-weight: 500; color: #d7dee0; overflow: hidden; text-overflow: ellipsis; text-align: right; }
+      .tfs-chart strong { font-weight: 500; color: var(--tfs-text-primary); overflow: hidden; text-overflow: ellipsis; text-align: right; }
       .tfs-chart p { height: 12px; margin: 0; border-top: 1px dotted rgba(255,255,255,.18); }
       .tfs-net-bars { height: 38px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
       .tfs-net-bars span { height: 30px; display: flex; align-items: end; justify-content: center; gap: 1px; }
@@ -1846,19 +2077,19 @@ fi
       .tabby-status table { width: calc(100% - 20px); margin: 0 10px 10px; border-collapse: collapse; table-layout: fixed; }
       .tabby-status th { border-bottom: 1px solid rgba(255,255,255,.1); padding: 5px 4px; font-weight: 600; color: #8ea1a7; }
       .tabby-status th:last-child { text-align: right; }
-      .tabby-status td { position: relative; padding: 3px 5px; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+      .tabby-status td { position: relative; padding: 3px 5px; color: var(--tfs-text-primary); opacity: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .tabby-status tr:nth-child(even) td { background: rgba(255,255,255,.035); }
       .tabby-status td:first-child { width: 62%; }
       .tabby-status td:last-child { text-align: right; }
       .tabby-status td:last-child i { position: absolute; top: 0; right: 0; bottom: 0; background: rgba(49, 198, 107, .16); z-index: 0; }
       .tabby-status td:last-child span { position: relative; z-index: 1; }
       .tfs-detail-backdrop { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: rgba(8,12,14,.58); }
-      .tfs-detail-dialog { width: min(980px, calc(100vw - 56px)); height: min(680px, calc(100vh - 56px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(127,200,255,.22); background: #1f272a; color: #d7dee0; box-shadow: 0 18px 60px rgba(0,0,0,.42); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; }
+      .tfs-detail-dialog { width: min(980px, calc(100vw - 56px)); height: min(680px, calc(100vh - 56px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(127,200,255,.22); background: #1f272a; color: var(--tfs-text-primary); box-shadow: 0 18px 60px rgba(0,0,0,.42); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; }
       .tfs-detail-top { display: grid; grid-template-columns: max-content 1fr max-content; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.1); }
       .tfs-detail-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
       .tfs-detail-top strong { font-size: 14px; color: #edf3f5; }
       .tfs-detail-top span { color: #8ea1a7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .tfs-detail-top button { border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: #d7dee0; padding: 4px 10px; font: inherit; cursor: pointer; }
+      .tfs-detail-top button { border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: var(--tfs-text-primary); padding: 4px 10px; font: inherit; cursor: pointer; }
       .tfs-detail-top .tfs-detail-icon-button { width: 18px; height: 18px; display: inline-grid; place-items: center; padding: 0; border-radius: 4px; background: transparent; }
       .tfs-detail-pause-icon { width: 10px; height: 10px; position: relative; display: block; }
       .tfs-detail-pause-icon::before,
@@ -1877,7 +2108,7 @@ fi
       .tfs-detail-table th, .tfs-detail-table td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,.07); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
       .tfs-detail-table th { position: sticky; top: 0; z-index: 1; background: #232c2f; color: #8ea1a7; font-weight: 600; }
       .tfs-detail-table th.tfs-resizable-col { position: sticky; }
-      .tfs-detail-table td { color: #d7dee0; font-variant-numeric: tabular-nums; }
+      .tfs-detail-table td { color: var(--tfs-text-primary); font-variant-numeric: tabular-nums; }
       .tfs-detail-table tr:nth-child(even) td { background: rgba(255,255,255,.025); }
       .tfs-detail-table th button { border: 0; background: transparent; color: inherit; padding: 0; font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
       .tfs-detail-table th button:hover, .tfs-detail-table th button.tfs-sort-active { color: #edf3f5; }
@@ -1888,7 +2119,7 @@ fi
       .tfs-col-resizer:hover::after, .tfs-col-resizing .tfs-col-resizer::after { background: rgba(127,200,255,.72); }
       .tfs-col-resizing { cursor: col-resize !important; user-select: none !important; }
       .tfs-context-menu { position: fixed; z-index: 10000; min-width: 132px; padding: 5px; border: 1px solid rgba(127,200,255,.24); background: #232c2f; box-shadow: 0 12px 32px rgba(0,0,0,.38); }
-      .tfs-context-menu button { display: block; width: 100%; border: 0; background: transparent; color: #d7dee0; padding: 6px 9px; text-align: left; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; cursor: pointer; }
+      .tfs-context-menu button { display: block; width: 100%; border: 0; background: transparent; color: var(--tfs-text-primary); padding: 6px 9px; text-align: left; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; cursor: pointer; }
       .tfs-context-menu button:hover { background: rgba(127,200,255,.12); color: #edf3f5; }
     `
     document.head.appendChild(style)
