@@ -6,7 +6,7 @@ declare const __non_webpack_require__: any
 
 type DiskRow = {
   path: string
-  used: string
+  avail: string
   size: string
   pct: number
 }
@@ -90,6 +90,7 @@ type DetailModalState = {
   timer?: number
   inflight: boolean
   paused: boolean
+  lastText?: string
   networkSnapshots?: Map<string, { uploadBytes: number, downloadBytes: number, ts: number }>
 }
 
@@ -109,6 +110,7 @@ type StatusPayload = {
   rx: string
   tx: string
   iface: string
+  ifaceList: string
   disks: DiskRow[]
   processes: ProcessRow[]
   latency: number
@@ -160,6 +162,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
   private processSort = new WeakMap<BaseTerminalTabComponent<any>, ProcessSortState>()
   private detailModals = new WeakMap<BaseTerminalTabComponent<any>, DetailModalState>()
   private detailSort = new WeakMap<BaseTerminalTabComponent<any>, DetailSortState>()
+  private networkIfaceSelection = new WeakMap<BaseTerminalTabComponent<any>, string>()
 
   attach (terminal: BaseTerminalTabComponent<any>): void {
     super.attach(terminal)
@@ -170,6 +173,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     const panel = this.createPanel()
     this.bindProcessSorting(terminal, panel)
     this.bindDetailEntrypoints(terminal, panel)
+    this.bindIfacePicker(terminal, panel)
     this.panels.set(terminal, panel)
     this.mountPanel(terminal, panel)
 
@@ -197,7 +201,9 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     this.netHistory.delete(terminal)
     this.latencyHistory.delete(terminal)
     this.processSort.delete(terminal)
+    this.networkIfaceSelection.delete(terminal)
     this.closeDetailModal(terminal)
+    this.closeIfaceMenu()
     this.detailSort.delete(terminal)
     super.detach(terminal)
   }
@@ -219,7 +225,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
 
     const fastLaunch = () => {
       if (this.collectorGenerations.get(terminal) === generation) {
-        void this.collectViaSshExec(terminal, 'fast', this.fastCollectorExecCommand(), generation)
+        void this.collectViaSshExec(terminal, 'fast', this.fastCollectorExecCommand(this.networkIfaceSelection.get(terminal) || ''), generation)
       }
     }
     const processLaunch = () => {
@@ -273,7 +279,6 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     const sshSession = (terminal as any).sshSession ?? (terminal.session as any)?.ssh
     const ssh = sshSession?.ssh
     if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
-      this.setData(panel, 'status', '')
       return
     }
 
@@ -294,7 +299,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     } catch (error) {
       console.warn('[tabby-status] SSH exec failed', error)
       if (this.panels.get(terminal) === panel && this.collectorGenerations.get(terminal) === generation) {
-        this.setStatus(panel, kind, `采集失败: ${error instanceof Error ? error.message : String(error)}`)
+        this.setStatus(panel)
       }
     } finally {
       inflight.delete(kind)
@@ -339,8 +344,10 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     return output
   }
 
-  private fastCollectorExecCommand (): string {
-    const script = String.raw`now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f", time()*1000' 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || printf "%s000" "$(date +%s)"; }
+  private fastCollectorExecCommand (selectedIface = ''): string {
+    const safeSelectedIface = this.shellQuote(selectedIface)
+    const script = String.raw`selected_iface=__TABBY_STATUS_SELECTED_IFACE__
+now_ms() { perl -MTime::HiRes=time -e 'printf "%.0f", time()*1000' 2>/dev/null || python3 -c 'import time; print(int(time.time()*1000))' 2>/dev/null || printf "%s000" "$(date +%s)"; }
 ts=$(now_ms)
 os=$(uname -s 2>/dev/null)
 if [ "$os" = "Darwin" ]; then
@@ -348,7 +355,11 @@ if [ "$os" = "Darwin" ]; then
   cpu=$(top -l 1 -n 0 2>/dev/null | awk '/CPU usage/ {for(i=1;i<=NF;i++){if($i=="user,") user=$(i-1); if($i=="sys,") sys=$(i-1)} gsub("%","",user); gsub("%","",sys); printf "%d", user+sys}')
   cpuCores=$(sysctl -n hw.ncpu 2>/dev/null)
   mem=$(vm_stat 2>/dev/null | awk -v total="$(sysctl -n hw.memsize 2>/dev/null)" '/page size of/{page=$8; gsub(/\./,"",page)} /Pages active/{active=$3; gsub(/\./,"",active)} /Pages wired down/{wired=$4; gsub(/\./,"",wired)} /Pages occupied by compressor/{comp=$5; gsub(/\./,"",comp)} END{used=(active+wired+comp)*page; if(total>0) printf "%d|%.1fG|%.1fG|0|0M|0M", used*100/total, used/1073741824, total/1073741824; else printf "0|0G|0G|0|0M|0M"}')
+  ifaceList=$(netstat -ibn 2>/dev/null | awk '$1!="Name" && $1!="lo0" && $7 ~ /^[0-9]+$/ && $10 ~ /^[0-9]+$/ {seen[$1]=1} END{first=1; for(iface in seen){if(!first) printf ","; printf "%s", iface; first=0}}')
   iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
+  if [ -n "$selected_iface" ] && printf ",%s," "$ifaceList" | grep -F ",$selected_iface," >/dev/null 2>&1; then
+    iface="$selected_iface"
+  fi
   bytes=$(netstat -ibn 2>/dev/null | awk -v iface="$iface" '$1==iface && $7 ~ /^[0-9]+$/ && $10 ~ /^[0-9]+$/ {rx+=$7; tx+=$10} END{printf "%s|%s", rx, tx}')
   rx=$(printf "%s" "$bytes" | cut -d'|' -f1)
   tx=$(printf "%s" "$bytes" | cut -d'|' -f2)
@@ -359,8 +370,12 @@ else
   cpuTotal=$(printf "%s" "$cpuStats" | cut -d'|' -f2)
   cpuCores=$(getconf _NPROCESSORS_ONLN 2>/dev/null || nproc 2>/dev/null || grep -c '^processor' /proc/cpuinfo 2>/dev/null)
   mem=$(awk 'function fmt_kib(kib){return kib>=1048576?sprintf("%.1fG",kib/1048576):sprintf("%dM",kib/1024)} /MemTotal/{mt=$2}/MemAvailable/{ma=$2}/SwapTotal/{st=$2}/SwapFree/{sf=$2}END{mu=mt-ma; su=st-sf; printf "%d|%.1fG|%.1fG|%d|%s|%s", (mu*100/mt), mu/1048576, mt/1048576, st?su*100/st:0, fmt_kib(su), fmt_kib(st)}' /proc/meminfo 2>/dev/null)
+  ifaceList=$(ls /sys/class/net 2>/dev/null | grep -v '^lo$' | paste -sd, -)
   iface=$(ip route get 1 2>/dev/null | awk '{for(i=1;i<=NF;i++)if($i=="dev"){print $(i+1);exit}}')
   [ -z "$iface" ] && iface=$(ls /sys/class/net 2>/dev/null | grep -v lo | head -1)
+  if [ -n "$selected_iface" ] && [ -d "/sys/class/net/$selected_iface" ]; then
+    iface="$selected_iface"
+  fi
   rx=$(cat /sys/class/net/$iface/statistics/rx_bytes 2>/dev/null)
   tx=$(cat /sys/class/net/$iface/statistics/tx_bytes 2>/dev/null)
 fi
@@ -374,9 +389,11 @@ printf 'mem\t%s\n' "$mem"
 printf 'rxBytes\t%s\n' "$rx"
 printf 'txBytes\t%s\n' "$tx"
 printf 'iface\t%s\n' "$iface"
+printf 'ifaceList\t%s\n' "$ifaceList"
+printf 'selectedIface\t%s\n' "$selected_iface"
 printf 'latency\t%s\n' "$lat"
 `
-    return this.encodeShellScript(script)
+    return this.encodeShellScript(script.replace('__TABBY_STATUS_SELECTED_IFACE__', safeSelectedIface))
   }
 
   private processCollectorExecCommand (): string {
@@ -426,7 +443,7 @@ printf 'ip\t%s\n' "$ipaddr"
 printf 'publicIp\t%s\n' "$publicIp"
 printf 'localIp\t%s\n' "$localIp"
 printf 'uptime\t%s\n' "$up"
-df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n", $6,$3,$2,$5}' | head -40
+df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n", $6,$4,$2,$5}' | head -40
 `
     return this.encodeShellScript(script)
   }
@@ -443,7 +460,6 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     panel.innerHTML = `
       <div class="tfs-top"><span>系统监控</span><span class="tfs-dot"></span></div>
       <div class="tfs-ip"><span>IP</span><em data-k="ip-type">-</em><strong>等待连接</strong><button>复制</button></div>
-      <div class="tfs-status" data-k="status"></div>
       <div class="tfs-kv"><span>运行</span><b data-k="uptime">-</b></div>
       <div class="tfs-kv"><span>负载</span><b data-k="load">-</b></div>
       <div class="tfs-meter"><span>CPU</span><i><em data-bar="cpu"></em><b class="tfs-meter-value" data-meter="cpu"><span data-k="cpu-pct"></span><span data-k="cpu-detail"></span></b></i></div>
@@ -453,20 +469,41 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       <div class="tfs-tabs"><button type="button" data-sort="mem" aria-pressed="false" title="按内存排序">内存</button><button type="button" data-sort="cpu" aria-pressed="false" title="按 CPU 排序">CPU</button><span>命令</span></div>
       <div class="tfs-processes tfs-clickable" data-open-detail="process" data-k="processes" title="打开进程详情"></div>
       <div class="tfs-section tfs-clickable" data-open-detail="network" title="打开网络详情">网络</div>
-      <div class="tfs-chart tfs-clickable" data-open-detail="network" title="打开网络详情"><div class="tfs-chart-head tfs-net-head tfs-nowrap"><b data-k="tx">0B/s</b><b data-k="rx">0B/s</b><strong data-k="net-peak">峰值 -</strong><strong data-k="iface">-</strong></div><div class="tfs-net-bars tfs-idle" data-k="net-bars"></div></div>
+      <div class="tfs-chart tfs-clickable" data-open-detail="network" title="打开网络详情"><div class="tfs-chart-head tfs-net-head tfs-nowrap"><b data-k="tx">0B/s</b><b data-k="rx">0B/s</b><strong data-k="net-peak">峰值 -</strong><button type="button" data-action="iface-picker" data-k="iface" title="切换网卡">-</button></div><div class="tfs-net-bars tfs-idle" data-k="net-bars"></div></div>
       <div class="tfs-chart tfs-lat tfs-clickable" data-open-detail="latency" title="打开延迟详情"><div class="tfs-chart-head tfs-lat-head tfs-nowrap"><b data-k="latency">0ms</b><strong data-k="latency-peak">延迟 -</strong></div><div class="tfs-latency-bars tfs-idle" data-k="latency-bars"></div></div>
       <div class="tfs-section">磁盘</div>
       <table><thead><tr><th>路径</th><th>可用/大小</th></tr></thead><tbody data-k="disks"></tbody></table>
       <div class="tfs-resizer" title="拖动调整面板宽度"></div>
     `
 
-    panel.querySelector('button')?.addEventListener('click', () => {
+    panel.querySelector<HTMLButtonElement>('.tfs-ip button')?.addEventListener('click', async event => {
+      const button = event.currentTarget as HTMLButtonElement
       const ip = panel.querySelector('.tfs-ip strong')?.textContent ?? ''
-      navigator.clipboard?.writeText(ip)
+      try {
+        if (!navigator.clipboard?.writeText) {
+          throw new Error('clipboard unavailable')
+        }
+        await navigator.clipboard.writeText(ip)
+        this.showIpCopyFeedback(button, '已复制')
+      } catch {
+        this.showIpCopyFeedback(button, '复制失败')
+      }
     })
 
     this.injectStyles()
     return panel
+  }
+
+  private showIpCopyFeedback (button: HTMLButtonElement, text: string): void {
+    const original = button.dataset.originalText || button.textContent || '复制'
+    button.dataset.originalText = original
+    button.textContent = text
+    button.classList.toggle('tfs-copy-ok', text === '已复制')
+    button.classList.toggle('tfs-copy-fail', text === '复制失败')
+    window.setTimeout(() => {
+      button.textContent = original
+      button.classList.remove('tfs-copy-ok', 'tfs-copy-fail')
+    }, 1200)
   }
 
   private bindProcessSorting (terminal: BaseTerminalTabComponent<any>, panel: HTMLElement): void {
@@ -490,6 +527,76 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
       }
 
       button.addEventListener('click', toggleSort)
+    }
+  }
+
+  private bindIfacePicker (terminal: BaseTerminalTabComponent<any>, panel: HTMLElement): void {
+    const button = panel.querySelector<HTMLButtonElement>('button[data-action="iface-picker"]')
+    button?.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      this.openIfaceMenu(terminal, button)
+    })
+  }
+
+  private openIfaceMenu (terminal: BaseTerminalTabComponent<any>, anchor: HTMLElement): void {
+    this.closeIfaceMenu()
+    const state = this.state.get(terminal) ?? {}
+    const current = this.networkIfaceSelection.get(terminal) || ''
+    const ifaceList = String(state.ifaceList || state.iface || '').split(',').map(item => item.trim()).filter(Boolean)
+    const uniqueIfaces = Array.from(new Set(ifaceList))
+    if (uniqueIfaces.length === 0) {
+      return
+    }
+
+    const menu = document.createElement('div')
+    menu.className = 'tfs-iface-menu'
+    menu.innerHTML = [
+      `<button type="button" data-iface="" class="${current ? '' : 'active'}">自动</button>`,
+      ...uniqueIfaces.map(iface => `<button type="button" data-iface="${this.escape(iface)}" class="${iface === current ? 'active' : ''}">${this.escape(iface)}</button>`),
+    ].join('')
+
+    menu.addEventListener('click', event => {
+      const item = (event.target as HTMLElement).closest<HTMLButtonElement>('button[data-iface]')
+      if (!item) {
+        return
+      }
+      this.selectNetworkInterface(terminal, item.dataset.iface || '')
+    })
+
+    document.body.appendChild(menu)
+    const rect = anchor.getBoundingClientRect()
+    const menuWidth = 168
+    menu.style.left = `${Math.max(8, Math.min(window.innerWidth - menuWidth - 8, rect.right - menuWidth))}px`
+    menu.style.top = `${Math.min(window.innerHeight - 8, rect.bottom + 6)}px`
+    window.setTimeout(() => {
+      const close = (event: MouseEvent) => {
+        if (!menu.contains(event.target as Node)) {
+          this.closeIfaceMenu()
+          document.removeEventListener('click', close)
+        }
+      }
+      document.addEventListener('click', close)
+    })
+  }
+
+  private selectNetworkInterface (terminal: BaseTerminalTabComponent<any>, iface: string): void {
+    if (iface) {
+      this.networkIfaceSelection.set(terminal, iface)
+    } else {
+      this.networkIfaceSelection.delete(terminal)
+    }
+    this.netSnapshots.delete(terminal)
+    this.netHistory.delete(terminal)
+    const current = this.state.get(terminal) ?? {}
+    this.state.set(terminal, { ...current, selectedIface: iface, rx: '0B/s', tx: '0B/s', netHistory: { rx: [], tx: [] } })
+    this.closeIfaceMenu()
+    this.scheduleCollector(terminal)
+  }
+
+  private closeIfaceMenu (): void {
+    for (const menu of Array.from(document.querySelectorAll('.tfs-iface-menu'))) {
+      menu.remove()
     }
   }
 
@@ -571,24 +678,45 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     const ssh = sshSession?.ssh
     if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
       if (state.kind !== 'latency') {
-        state.status.textContent = '等待 SSH'
+        state.status.textContent = ''
+        this.renderEmptyDetailRows(state)
         return
       }
     }
 
     state.inflight = true
     try {
+      let streamedText = ''
       const text = state.kind === 'latency'
-        ? await this.collectLatencyDetails(terminal, ssh)
+        ? await this.collectLatencyDetails(terminal, ssh, text => {
+            if (this.detailModals.get(terminal) !== state) {
+              return
+            }
+            streamedText = text
+            state.lastText = text
+            state.status.textContent = ''
+            this.renderDetailRows(terminal, state, streamedText)
+          })
         : await this.runSshExec(ssh, this.detailCollectorExecCommand(terminal, state.kind), 8000)
       if (this.detailModals.get(terminal) !== state) {
         return
       }
       state.status.textContent = ''
-      this.renderDetailRows(terminal, state, text)
+      const finalText = state.kind === 'latency' && this.parseLatencyDetails(text).length === 0
+        ? state.lastText || text
+        : text
+      if (this.hasDetailRows(state, finalText)) {
+        state.lastText = finalText
+      }
+      this.renderDetailRows(terminal, state, finalText)
     } catch (error) {
       if (this.detailModals.get(terminal) === state) {
-        state.status.textContent = `刷新失败: ${error instanceof Error ? error.message : String(error)}`
+        state.status.textContent = ''
+        if (state.kind === 'latency' && state.lastText && this.hasDetailRows(state, state.lastText)) {
+          this.renderDetailRows(terminal, state, state.lastText)
+        } else {
+          this.renderEmptyDetailRows(state)
+        }
       }
     } finally {
       state.inflight = false
@@ -598,6 +726,9 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
   private startDetailRefreshTimer (terminal: BaseTerminalTabComponent<any>, state: DetailModalState): void {
     if (state.timer !== undefined) {
       window.clearInterval(state.timer)
+    }
+    if (state.kind === 'latency') {
+      return
     }
     const refresh = () => void this.refreshDetailModal(terminal)
     state.timer = window.setInterval(refresh, 1000)
@@ -642,6 +773,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
         <tbody></tbody>
       </table>
     `
+    this.renderEmptyDetailRows(state)
 
     for (const button of Array.from(state.body.querySelectorAll<HTMLButtonElement>('button[data-detail-sort]'))) {
       button.addEventListener('click', () => {
@@ -886,22 +1018,173 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     return this.latencyDetailCollectorExecCommand(this.getLatencyTraceTarget(terminal))
   }
 
-  private async collectLatencyDetails (terminal: BaseTerminalTabComponent<any>, ssh: any): Promise<string> {
+  private async collectLatencyDetails (terminal: BaseTerminalTabComponent<any>, ssh: any, onText?: (text: string) => void): Promise<string> {
     const target = this.getLatencyTraceTarget(terminal)
     if (target !== this.defaultLatencyTraceTarget()) {
       try {
-        const local = await this.runLocalCommand('/bin/sh', ['-lc', this.localLatencyDetailScript(target)], 30000)
-        if (local.trim()) {
+        const local = await this.collectLocalLatencyDetails(target, (_chunkText, stdout) => {
+          if (this.parseLatencyDetails(stdout).length > 0) {
+            onText?.(stdout)
+          }
+        })
+        if (this.parseLatencyDetails(local).length > 0) {
           return local
         }
       } catch (error) {
-        console.warn('[tabby-status] local traceroute failed, falling back to SSH', error)
+        console.warn('[tabby-status] local traceroute failed', error)
       }
+      return ''
     }
     if (!ssh?.openSessionChannel || !ssh?.activateChannel) {
       throw new Error('等待 SSH')
     }
     return this.runSshExec(ssh, this.latencyDetailCollectorExecCommand(target), 30000)
+  }
+
+  private async collectLocalLatencyDetails (target: string, onStdout?: (chunkText: string, stdout: string) => void): Promise<string> {
+    if (this.getLocalPlatform() === 'win32') {
+      return this.runLocalCommandStream('powershell.exe', ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', this.windowsLatencyDetailScript(target)], 45000, onStdout)
+    }
+    return this.runLocalCommandStream('/bin/sh', ['-lc', this.localLatencyDetailScript(target)], 45000, onStdout)
+  }
+
+  private getLocalPlatform (): string {
+    try {
+      const requireFn = typeof __non_webpack_require__ === 'function' ? __non_webpack_require__ : (globalThis as any).require
+      return String(requireFn?.('os')?.platform?.() || (globalThis as any).process?.platform || '')
+    } catch {
+      return String((globalThis as any).process?.platform || '')
+    }
+  }
+
+  private windowsLatencyDetailScript (target: string): string {
+    const safeTarget = this.powershellQuote(this.isTraceTarget(target) ? target : this.defaultLatencyTraceTarget())
+    return [
+      `$target = ${safeTarget}`,
+      '$tab = [char]9',
+      'function Test-PrivateIp {',
+      '  param([string]$Ip)',
+      '  if (-not $Ip) { return $false }',
+      "  if ($Ip -match '^(10\\.|127\\.|169\\.254\\.|192\\.168\\.)') { return $true }",
+      "  if ($Ip -match '^172\\.(1[6-9]|2[0-9]|3[0-1])\\.') { return $true }",
+      '  return $false',
+      '}',
+      'function Write-RouteRow {',
+      '  param(',
+      '    [string]$Hop,',
+      '    [string]$Ip,',
+      '    [string]$Loss,',
+      '    [string]$Sent,',
+      '    [string]$Last,',
+      '    [string]$Best,',
+      '    [string]$Worst,',
+      '    [string]$Avg',
+      '  )',
+      "  if (-not $Ip -or $Ip -eq '*') { $Ip = '--' }",
+      "  if (-not $Loss) { $Loss = '--' }",
+      "  if (-not $Sent) { $Sent = '--' }",
+      "  if (-not $Last) { $Last = '--' }",
+      "  if (-not $Best) { $Best = '--' }",
+      "  if (-not $Worst) { $Worst = '--' }",
+      "  if (-not $Avg) { $Avg = '--' }",
+      "  $location = '--'",
+      "  if (Test-PrivateIp $Ip) { $location = '局域网' }",
+      "  [Console]::Out.WriteLine((@('ldetail', $Hop, $Ip, '--', $location, '--', $Loss, $Sent, $Last, $Best, $Worst, $Avg) -join $tab))",
+      '  [Console]::Out.Flush()',
+      '}',
+      '$lines = & tracert.exe -d -h 30 -w 1000 $target 2>$null',
+      'foreach ($line in $lines) {',
+      "  if ($line -notmatch '^\\s*(\\d+)\\s+(.+)$') { continue }",
+      '  $hop = $Matches[1]',
+      '  $body = $Matches[2].Trim()',
+      "  $ip = '--'",
+      "  $ipMatches = [regex]::Matches($body, '(?i)(?:\\d{1,3}\\.){3}\\d{1,3}|(?:[0-9a-f]{1,4}:){1,}[0-9a-f:]*')",
+      '  if ($ipMatches.Count -gt 0) {',
+      '    $ip = $ipMatches[$ipMatches.Count - 1].Value',
+      '  }',
+      "  $timeMatches = [regex]::Matches($body, '(<\\s*1|\\d+)\\s*(?:ms|毫秒)')",
+      '  $sent = 3',
+      '  $received = $timeMatches.Count',
+      '  if ($received -le 0) {',
+      "    Write-RouteRow $hop $ip '100%' $sent '*' '--' '--' '--'",
+      '    continue',
+      '  }',
+      '  $values = @()',
+      '  $labels = @()',
+      '  foreach ($match in $timeMatches) {',
+      "    $raw = $match.Groups[1].Value -replace '\\s+', ''",
+      "    if ($raw.StartsWith('<')) {",
+      '      $values += 1',
+      "      $labels += '<1'",
+      '    } else {',
+      '      $values += [int]$raw',
+      '      $labels += ([string][int]$raw)',
+      '    }',
+      '  }',
+      '  $last = $labels[$labels.Count - 1]',
+      '  $bestValue = ($values | Measure-Object -Minimum).Minimum',
+      '  $worstValue = ($values | Measure-Object -Maximum).Maximum',
+      '  $avgValue = [math]::Round((($values | Measure-Object -Average).Average))',
+      "  $best = if ($bestValue -le 1 -and ($labels -contains '<1')) { '<1' } else { [string][int]$bestValue }",
+      '  $worst = [string][int]$worstValue',
+      '  $avg = [string][int]$avgValue',
+      "  $loss = ('{0}%' -f [math]::Round((($sent - $received) * 100) / $sent))",
+      '  Write-RouteRow $hop $ip $loss $sent $last $best $worst $avg',
+      '}',
+    ].join('\n')
+  }
+
+  private hasDetailRows (state: DetailModalState, text: string): boolean {
+    if (state.kind === 'process') {
+      return this.parseProcessDetails(text).length > 0
+    }
+    if (state.kind === 'network') {
+      return this.parseNetworkDetails(text).length > 0
+    }
+    return this.parseLatencyDetails(text).length > 0
+  }
+
+  private async runLocalCommandStream (app: string, argv: string[], timeoutMs = 8000, onStdout?: (chunkText: string, stdout: string) => void): Promise<string> {
+    const requireFn = typeof __non_webpack_require__ === 'function' ? __non_webpack_require__ : (globalThis as any).require
+    if (!requireFn) {
+      throw new Error('local command API unavailable')
+    }
+    const childProcess = requireFn('child_process')
+    return new Promise<string>((resolve, reject) => {
+      let stdout = ''
+      let stderr = ''
+      const child = childProcess.spawn(app, argv, { stdio: ['ignore', 'pipe', 'pipe'] })
+      const timeout = window.setTimeout(() => {
+        child.kill?.()
+        if (stdout.trim()) {
+          resolve(stdout)
+        } else {
+          reject(new Error('timeout'))
+        }
+      }, timeoutMs)
+      child.stdout?.on('data', (data: Buffer | string) => {
+        const chunkText = String(data)
+        stdout += chunkText
+        if (onStdout) {
+          onStdout(chunkText, stdout)
+        }
+      })
+      child.stderr?.on('data', (data: Buffer | string) => {
+        stderr += String(data)
+      })
+      child.on('error', (error: Error) => {
+        window.clearTimeout(timeout)
+        reject(error)
+      })
+      child.on('close', () => {
+        window.clearTimeout(timeout)
+        if (!stdout.trim() && stderr.trim()) {
+          reject(new Error(stderr.trim().slice(0, 120)))
+          return
+        }
+        resolve(stdout)
+      })
+    })
   }
 
   private async runLocalCommand (app: string, argv: string[], timeoutMs = 8000): Promise<string> {
@@ -940,6 +1223,12 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
         if (this.isTraceTarget(value)) {
           return String(value).trim()
         }
+      }
+    }
+    const current = this.state.get(terminal) ?? {}
+    for (const value of [current.publicIp, current.ip, current.localIp]) {
+      if (this.isTraceTarget(value)) {
+        return String(value).trim()
       }
     }
     return this.defaultLatencyTraceTarget()
@@ -1052,28 +1341,64 @@ geo_lookup() {
       city=$(printf "%s\n" "$geo" | awk 'NR==4{print}')
       isp=$(printf "%s\n" "$geo" | awk 'NR==5{print}')
       asline=$(printf "%s\n" "$geo" | awk 'NR==6{print}')
-      location=$(printf "%s/%s/%s/%s" "$country" "$region" "$city" "$isp" | awk '{gsub(/\/+/, "/"); gsub(/^\/|\/$/, ""); print $0==""?"--":$0}')
+      location=$(printf "%s/%s/%s/%s" "$country" "$region" "$city" "$isp" | awk '{gsub(/\/+/, "/"); gsub(/^\/|\/$/, ""); if($0=="") print "--"; else print $0}')
       asn=$(printf "%s" "$asline" | awk '{print $1}')
       [ -z "$asn" ] && asn="--"
     fi
   fi
   printf "%s\t%s" "$location" "$asn"
 }
-emit_row() {
+ptr_lookup() {
+  ip="$1"
+  case "$ip" in ""|"-"|"*"|"--") printf -- "--"; return ;; esac
+  if command -v getent >/dev/null 2>&1; then
+    ptr=$(getent hosts "$ip" 2>/dev/null | awk '{print $2; exit}')
+    [ -n "$ptr" ] && { printf "%s" "$ptr"; return; }
+  fi
+  if command -v nslookup >/dev/null 2>&1; then
+    ptr=$(nslookup "$ip" 2>/dev/null | awk -F'= ' '/name =/{gsub(/\.$/,"",$2); print $2; exit}')
+    [ -n "$ptr" ] && { printf "%s" "$ptr"; return; }
+  fi
+  printf -- "--"
+}
+emit_fast_row() {
+  hop="$1"; ip="$2"; loss="$3"; sent="$4"; last="$5"; best="$6"; worst="$7"; avg="$8"
+  location="--"; asn="--"
+  if is_private_ip "$ip"; then
+    location="局域网"
+  fi
+  [ -z "$ip" ] && ip="--"
+  [ -z "$loss" ] && loss="--"
+  [ -z "$sent" ] && sent="--"
+  [ -z "$last" ] && last="--"
+  [ -z "$best" ] && best="--"
+  [ -z "$worst" ] && worst="--"
+  [ -z "$avg" ] && avg="--"
+  printf "ldetail\t%s\t%s\t--\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$hop" "$ip" "$location" "$asn" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+}
+emit_geo_row() {
   hop="$1"; ip="$2"; loss="$3"; sent="$4"; last="$5"; best="$6"; worst="$7"; avg="$8"
   geo=$(geo_lookup "$ip")
+  ptr=$(ptr_lookup "$ip")
   location=$(printf "%s" "$geo" | awk -F '\t' '{print $1}')
   asn=$(printf "%s" "$geo" | awk -F '\t' '{print $2}')
   [ -z "$ip" ] && ip="--"
+  [ -z "$ptr" ] && ptr="--"
   [ -z "$location" ] && location="--"
   [ -z "$asn" ] && asn="--"
-  printf "ldetail\t%s\t%s\t--\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$hop" "$ip" "$location" "$asn" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+  printf "ldetail\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$hop" "$ip" "$ptr" "$location" "$asn" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
 }
-if command -v traceroute >/dev/null 2>&1; then
-  traceroute -n -w 1 -q 3 -m 24 "$target" 2>/dev/null | awk 'NR>1{
+emit_row() {
+  emit_fast_row "$@"
+  emit_geo_row "$@" &
+}
+parse_traceroute() {
+  awk '{
     hop=$1; ip=$2
-    if(ip=="*"||ip=="") {printf "%s\t--\t100%%\t3\t*\t--\t--\t--\n", hop; next}
-    sent=3; count=0; sum=0; best=""; worst=""; last="*"
+    if(hop !~ /^[0-9]+$/) next
+    sent=1
+    if(ip=="*"||ip=="") {printf "%s\t--\t100%%\t1\t*\t--\t--\t--\n", hop; next}
+    count=0; sum=0; best=""; worst=""; last="*"
     for(i=3;i<=NF;i++){
       if($i ~ /^[0-9.]+$/ && $(i+1)=="ms"){
         v=$i+0; count++; sum+=v; last=sprintf("%.0f", v)
@@ -1086,19 +1411,198 @@ if command -v traceroute >/dev/null 2>&1; then
     best=count?sprintf("%.0f", best):"--"
     worst=count?sprintf("%.0f", worst):"--"
     printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n", hop, ip, loss, sent, last, best, worst, avg
-  }' | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+    fflush()
+  }'
+}
+score_rows() {
+  awk -F '\t' 'NF>=2{rows++; if($2!="--") valid++} END{printf "%s\t%s", valid+0, rows+0}'
+}
+emit_direct_target() {
+  printf "%s\n" "$best_direct" | awk -F '\t' 'BEGIN{OFS="\t"} NF>=8{$1="目标"; print; exit}'
+}
+target_seen_in_rows() {
+  rows="$1"
+  case "$target" in
+    *[!0-9.]*|"") return 1 ;;
+  esac
+  printf "%s\n" "$rows" | awk -F '\t' -v target="$target" '$2==target{found=1} END{exit found?0:1}'
+}
+probe_target_direct() {
+  [ -z "$direct_src" ] && return
+  os=$(uname -s 2>/dev/null)
+  if [ "$os" = "Darwin" ]; then
+    ping -S "$direct_src" -c 1 -W 1000 "$target" 2>/dev/null | awk '
+      /bytes from/ {
+        ip=$4; gsub(/:$/,"",ip)
+        for(i=1;i<=NF;i++){
+          if($i ~ /^time[=<]/){
+            value=$i
+            sub(/^time[=<]/, "", value)
+            sub(/ms$/, "", value)
+            if($i ~ /^time</) last="<1"; else last=sprintf("%.0f", value+0)
+          }
+        }
+      }
+      END {
+        if(ip!="" && last!="") printf "目标\t%s\t0%%\t1\t%s\t%s\t%s\t%s\n", ip, last, last, last, last
+      }'
+  else
+    ping -I "$direct_src" -c 1 -W 1 "$target" 2>/dev/null | awk '
+      /bytes from/ {
+        ip=$4; gsub(/:$/,"",ip)
+        for(i=1;i<=NF;i++){
+          if($i ~ /^time[=<]/){
+            value=$i
+            sub(/^time[=<]/, "", value)
+            sub(/ms$/, "", value)
+            if($i ~ /^time</) last="<1"; else last=sprintf("%.0f", value+0)
+          }
+        }
+      }
+      END {
+        if(ip!="" && last!="") printf "目标\t%s\t0%%\t1\t%s\t%s\t%s\t%s\n", ip, last, last, last, last
+      }'
+  fi
+}
+emit_raw_rows() {
+  while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+    [ -z "$hop" ] && continue
     emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
   done
+}
+get_current_route_iface() {
+  if command -v route >/dev/null 2>&1; then
+    route -n get "$target" 2>/dev/null | awk '/interface:/{print $2; exit}'
+  fi
+}
+get_iface_ipv4() {
+  iface="$1"
+  [ -z "$iface" ] && return
+  if command -v ip >/dev/null 2>&1; then
+    ip -o -4 addr show dev "$iface" 2>/dev/null | awk '{split($4,a,"/"); print a[1]; exit}'
+    return
+  fi
+  if command -v ifconfig >/dev/null 2>&1; then
+    ifconfig "$iface" 2>/dev/null | awk '/inet /{print $2; exit}'
+  fi
+}
+is_tun_iface() {
+  case "$1" in
+    utun*|tun*|tap*|wg*|tailscale*|zt*|gif*|stf*|lo*) return 0 ;;
+    *) return 1 ;;
+  esac
+}
+get_direct_route() {
+  current_iface=$(get_current_route_iface)
+  if [ -n "$current_iface" ] && ! is_tun_iface "$current_iface"; then
+    current_src=$(get_iface_ipv4 "$current_iface")
+    [ -n "$current_src" ] && { printf "%s\t%s" "$current_iface" "$current_src"; return; }
+  fi
+  if command -v netstat >/dev/null 2>&1; then
+    direct_iface=$(netstat -rn -f inet 2>/dev/null | awk '$1=="default" && $NF !~ /^(utun|tun|tap|wg|tailscale|zt|gif|stf|lo)/ {print $NF; exit}')
+    direct_src=$(get_iface_ipv4 "$direct_iface")
+    [ -n "$direct_iface" ] && [ -n "$direct_src" ] && { printf "%s\t%s" "$direct_iface" "$direct_src"; return; }
+  fi
+}
+choose_trace() {
+  best=""
+  best_valid=-1
+  best_rows=0
+  best_direct=""
+  run_candidate() {
+    rows="$("$@" 2>/dev/null | parse_traceroute)"
+    [ -z "$rows" ] && return
+    score=$(printf "%s\n" "$rows" | score_rows)
+    valid=$(printf "%s" "$score" | awk -F '\t' '{print $1+0}')
+    count=$(printf "%s" "$score" | awk -F '\t' '{print $2+0}')
+    if [ "$count" -le 1 ]; then
+      [ -z "$best_direct" ] && [ "$valid" -gt 0 ] && best_direct="$rows"
+      return
+    fi
+    if [ "$valid" -gt "$best_valid" ] || { [ "$valid" -eq "$best_valid" ] && [ "$count" -gt "$best_rows" ]; }; then
+      best="$rows"
+      best_valid="$valid"
+      best_rows="$count"
+    fi
+  }
+  emit_best_if_route_shaped() {
+    if [ "$best_rows" -gt 1 ] && [ "$best_valid" -gt 0 ]; then
+      printf "%s\n" "$best" | emit_raw_rows
+      if ! target_seen_in_rows "$best"; then
+        probe_target_direct | emit_raw_rows
+      fi
+      wait
+      return 0
+    fi
+    return 1
+  }
+  run_direct_stream() {
+    tmpdir="$TMPDIR"
+    [ -z "$tmpdir" ] && tmpdir="/tmp"
+    tmp="$tmpdir/tabby-status-trace-$$-$RANDOM.tsv"
+    "$@" 2>/dev/null | parse_traceroute | while IFS="$(printf '\t')" read -r hop ip loss sent last best worst avg; do
+      [ -z "$hop" ] && continue
+      printf "%s\t%s\t%s\t%s\t%s\t%s\t%s\t%s\n" "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg" >> "$tmp"
+      emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
+    done
+    rows=$(cat "$tmp" 2>/dev/null)
+    rm -f "$tmp" 2>/dev/null
+    [ -z "$rows" ] && return 1
+    score=$(printf "%s\n" "$rows" | score_rows)
+    valid=$(printf "%s" "$score" | awk -F '\t' '{print $1+0}')
+    count=$(printf "%s" "$score" | awk -F '\t' '{print $2+0}')
+    if [ "$count" -gt 1 ] && [ "$valid" -gt 0 ]; then
+      if ! target_seen_in_rows "$rows"; then
+        probe_target_direct | emit_raw_rows
+      fi
+      wait
+      return 0
+    fi
+    wait
+    return 1
+  }
+  if command -v traceroute >/dev/null 2>&1; then
+    direct_route=$(get_direct_route)
+    direct_iface=$(printf "%s" "$direct_route" | awk -F '\t' '{print $1}')
+    direct_src=$(printf "%s" "$direct_route" | awk -F '\t' '{print $2}')
+    if [ -n "$direct_iface" ] && [ -n "$direct_src" ]; then
+      run_direct_stream traceroute -I -i "$direct_iface" -s "$direct_src" -n -w 1 -q 1 -m 30 "$target" && return
+      run_direct_stream traceroute -i "$direct_iface" -s "$direct_src" -n -w 1 -q 1 -m 30 "$target" && return
+    fi
+    run_candidate traceroute -I -n -w 1 -q 1 -m 12 "$target"
+    run_candidate traceroute -T -p 22 -n -w 1 -q 1 -m 12 "$target"
+    run_candidate traceroute -P TCP -p 22 -n -w 1 -q 1 -m 12 "$target"
+    run_candidate traceroute -n -w 1 -q 1 -m 12 "$target"
+  fi
+  if [ "$best_rows" -gt 1 ]; then
+    printf "%s\n" "$best" | emit_raw_rows
+    if [ "$best_valid" -eq 0 ] && [ -n "$best_direct" ]; then
+      emit_direct_target | emit_raw_rows
+    fi
+  else
+    printf "%s\n" "$best_direct" | emit_raw_rows
+  fi
+  wait
+}
+if command -v traceroute >/dev/null 2>&1; then
+  choose_trace
+elif command -v tracepath >/dev/null 2>&1; then
+  tracepath -n -m 12 "$target" 2>/dev/null | awk '{
+    hop=$1; ip=$2
+    if(hop ~ /^[0-9]+:/){
+      gsub(":","",hop)
+      if(ip=="no" || ip=="") ip="--"
+      printf "%s\t%s\t--\t--\t--\t--\t--\t--\n", hop, ip
+    }
+  }' | emit_raw_rows
+  wait
 fi
 `.replace('__TABBY_STATUS_TRACE_TARGET__', safeTarget)
   }
 
   private latencyDetailCollectorExecCommand (target: string): string {
-    const fallbackTarget = this.defaultLatencyTraceTarget()
-    const safeTarget = this.shellQuote(this.isTraceTarget(target) ? target : fallbackTarget)
-    const safeFallbackTarget = this.shellQuote(fallbackTarget)
+    const safeTarget = this.shellQuote(this.isTraceTarget(target) ? target : this.defaultLatencyTraceTarget())
     const script = String.raw`target=__TABBY_STATUS_TRACE_TARGET__
-fallback_target=__TABBY_STATUS_FALLBACK_TRACE_TARGET__
 resolve_target_ip() {
   value="$1"
   case "$value" in
@@ -1115,18 +1619,7 @@ resolve_target_ip() {
   fi
   printf "%s" "$value"
 }
-is_local_trace_target() {
-  ip="$1"
-  [ -z "$ip" ] && return 1
-  for local_ip in $(hostname -I 2>/dev/null; ip -o -4 addr show 2>/dev/null | awk '{split($4,a,"/"); print a[1]}'); do
-    [ "$ip" = "$local_ip" ] && return 0
-  done
-  return 1
-}
 target_ip=$(resolve_target_ip "$target")
-if is_local_trace_target "$target_ip"; then
-  target="$fallback_target"
-fi
 ptr_lookup() {
   ip="$1"
   case "$ip" in ""|"-"|"*"|"--") printf -- "--"; return ;; esac
@@ -1177,7 +1670,7 @@ geo_lookup() {
         city=$(printf "%s\n" "$geo" | awk 'NR==4{print}')
         isp=$(printf "%s\n" "$geo" | awk 'NR==5{print}')
         asline=$(printf "%s\n" "$geo" | awk 'NR==6{print}')
-        location=$(printf "%s/%s/%s/%s" "$country" "$region" "$city" "$isp" | awk '{gsub(/\/+/, "/"); gsub(/^\/|\/$/, ""); print $0==""?"--":$0}')
+        location=$(printf "%s/%s/%s/%s" "$country" "$region" "$city" "$isp" | awk '{gsub(/\/+/, "/"); gsub(/^\/|\/$/, ""); if($0=="") print "--"; else print $0}')
         asn=$(printf "%s" "$asline" | awk '{print $1}')
         [ -z "$asn" ] && asn="--"
       fi
@@ -1224,10 +1717,11 @@ if command -v mtr >/dev/null 2>&1; then
       emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
     done
 elif command -v traceroute >/dev/null 2>&1; then
-  traceroute -n -w 1 -q 3 -m 16 "$target" 2>/dev/null | awk 'NR>1{
+  traceroute -n -w 1 -q 1 -m 12 "$target" 2>/dev/null | awk '{
     hop=$1; ip=$2
-    if(ip=="*"||ip=="") {printf "%s\t--\t100%%\t3\t*\t--\t--\t--\n", hop; next}
-    sent=3; count=0; sum=0; best=""; worst=""; last="*"
+    if(ip=="*"||ip=="") {printf "%s\t--\t100%%\t1\t*\t--\t--\t--\n", hop; next}
+    if(hop !~ /^[0-9]+$/) next
+    sent=1; count=0; sum=0; best=""; worst=""; last="*"
     for(i=3;i<=NF;i++){
       if($i ~ /^[0-9.]+$/ && $(i+1)=="ms"){
         v=$i+0; count++; sum+=v; last=sprintf("%.0f", v)
@@ -1244,7 +1738,7 @@ elif command -v traceroute >/dev/null 2>&1; then
     emit_row "$hop" "$ip" "$loss" "$sent" "$last" "$best" "$worst" "$avg"
   done
 elif command -v tracepath >/dev/null 2>&1; then
-  tracepath -n -m 16 "$target" 2>/dev/null | awk '{
+  tracepath -n -m 12 "$target" 2>/dev/null | awk '{
     hop=$1; ip=$2
     if(hop ~ /^[0-9]+:/){
       gsub(":","",hop)
@@ -1357,8 +1851,7 @@ EOF
 fi
 `
     return this.encodeShellScript(script
-      .replace('__TABBY_STATUS_TRACE_TARGET__', safeTarget)
-      .replace('__TABBY_STATUS_FALLBACK_TRACE_TARGET__', safeFallbackTarget))
+      .replace('__TABBY_STATUS_TRACE_TARGET__', safeTarget))
   }
 
   private renderDetailRows (terminal: BaseTerminalTabComponent<any>, state: DetailModalState, text: string): void {
@@ -1371,6 +1864,10 @@ fi
 
     if (state.kind === 'process') {
       const rows = this.sortDetailRows(this.parseProcessDetails(text), sort)
+      if (rows.length === 0) {
+        this.renderEmptyDetailRows(state)
+        return
+      }
       body.innerHTML = rows.map(row => `
         <tr data-process-pid="${this.escape(row.pid)}" data-process-name="${this.escape(this.getProcessName(row.command))}" data-process-command="${this.escape(row.command)}" data-process-location="${this.escape(row.location)}">
           <td>${this.escape(row.pid)}</td>
@@ -1386,6 +1883,10 @@ fi
 
     if (state.kind === 'network') {
       const rows = this.sortDetailRows(this.withNetworkRates(state, this.parseNetworkDetails(text)), sort)
+      if (rows.length === 0) {
+        this.renderEmptyDetailRows(state)
+        return
+      }
       body.innerHTML = rows.map(row => `
         <tr>
           <td>${this.escape(row.pid)}</td>
@@ -1402,6 +1903,10 @@ fi
     }
 
     const rows = this.parseLatencyDetails(text)
+    if (rows.length === 0) {
+      this.renderEmptyDetailRows(state)
+      return
+    }
     body.innerHTML = rows.map(row => `
       <tr>
         <td>${this.escape(row.hop)}</td>
@@ -1417,6 +1922,23 @@ fi
         <td>${this.escape(row.avg)}</td>
       </tr>
     `).join('')
+  }
+
+  private renderEmptyDetailRows (state: DetailModalState): void {
+    const body = state.body.querySelector('tbody')
+    if (!body) {
+      return
+    }
+    const columns = this.getDetailColumns(state.kind)
+    const rows = Array.from({ length: 8 }, (_, rowIndex) => `
+      <tr class="tfs-detail-empty-row" data-empty-detail="1">
+        ${columns.map((column, colIndex) => {
+          const width = Math.max(28, Math.min(86, Math.round(42 + ((rowIndex + colIndex) % 4) * 12 + (column.fill ? 18 : 0))))
+          return `<td><span class="tfs-detail-skeleton" style="width:${width}%"></span></td>`
+        }).join('')}
+      </tr>
+    `).join('')
+    body.innerHTML = rows
   }
 
   private parseProcessDetails (text: string): ProcessDetailRow[] {
@@ -1475,19 +1997,42 @@ fi
   }
 
   private parseLatencyDetails (text: string): LatencyDetailRow[] {
-    return text.split(/\r?\n/).filter(Boolean).map(line => line.split('\t')).filter(parts => parts[0] === 'ldetail').map(parts => ({
-      hop: parts[1] || '-',
-      ip: parts[2] || '--',
-      ptr: parts[3] || '--',
-      location: parts[4] || '--',
-      asn: parts[5] || '--',
-      loss: parts[6] || '--',
-      sent: parts[7] || '--',
-      last: parts[8] || '--',
-      best: parts[9] || '--',
-      worst: parts[10] || '--',
-      avg: parts[11] || '--',
-    }))
+    const rowsByHop = new Map<string, LatencyDetailRow>()
+    for (const parts of text.split(/\r?\n/).filter(Boolean).map(line => line.split('\t')).filter(parts => parts[0] === 'ldetail')) {
+      const row: LatencyDetailRow = {
+        hop: parts[1] || '-',
+        ip: parts[2] || '--',
+        ptr: parts[3] || '--',
+        location: parts[4] || '--',
+        asn: parts[5] || '--',
+        loss: parts[6] || '--',
+        sent: parts[7] || '--',
+        last: parts[8] || '--',
+        best: parts[9] || '--',
+        worst: parts[10] || '--',
+        avg: parts[11] || '--',
+      }
+      const previous = rowsByHop.get(row.hop)
+      rowsByHop.set(row.hop, previous ? this.mergeLatencyDetailRow(previous, row) : row)
+    }
+    return Array.from(rowsByHop.values())
+  }
+
+  private mergeLatencyDetailRow (previous: LatencyDetailRow, next: LatencyDetailRow): LatencyDetailRow {
+    const pick = (newValue: string, oldValue: string) => newValue && newValue !== '--' ? newValue : oldValue
+    return {
+      hop: previous.hop,
+      ip: pick(next.ip, previous.ip),
+      ptr: pick(next.ptr, previous.ptr),
+      location: pick(next.location, previous.location),
+      asn: pick(next.asn, previous.asn),
+      loss: pick(next.loss, previous.loss),
+      sent: pick(next.sent, previous.sent),
+      last: pick(next.last, previous.last),
+      best: pick(next.best, previous.best),
+      worst: pick(next.worst, previous.worst),
+      avg: pick(next.avg, previous.avg),
+    }
   }
 
   private sortDetailRows<T extends Record<string, unknown>> (rows: T[], sort?: DetailSortState): T[] {
@@ -1622,6 +2167,7 @@ fi
       rx: raw.rx || '0K',
       tx: raw.tx || '0K',
       iface: raw.iface || '-',
+      ifaceList: raw.ifaceList || raw.iface || '',
       disks: this.parseDisks(raw.disks),
       processes: this.parseProcesses(raw.processes),
       latency: Number(raw.latency || 0),
@@ -1630,7 +2176,6 @@ fi
     panel.querySelector('.tfs-dot')?.classList.add('on')
     this.setText(panel, '.tfs-ip strong', payload.ip)
     this.setData(panel, 'ip-type', payload.ipType)
-    this.setData(panel, 'status', '')
     this.setData(panel, 'uptime', payload.uptime)
     this.setData(panel, 'load', payload.cpuCores ? `${payload.load} / ${payload.cpuCores}核` : payload.load)
     this.setMeterData(panel, 'cpu', this.formatPercent(payload.cpu))
@@ -1671,8 +2216,8 @@ fi
         continue
       }
       if (key === 'disk') {
-        const [path, used, size, pct] = parts
-        disks.push([path, used, size, pct].join(','))
+        const [path, avail, size, pct] = parts
+        disks.push([path, avail, size, pct].join(','))
       } else if (key === 'proc') {
         const [pid, cpu, mem, command] = parts
         processes.push([pid, cpu, mem, command].join(','))
@@ -1716,6 +2261,11 @@ fi
         next.cpu = this.clampPercent(current.cpu, 1)
       }
       this.cpuSnapshots.set(terminal, { busy, total })
+    }
+
+    if (patch.iface !== undefined && current.iface !== undefined && patch.iface !== current.iface) {
+      this.netSnapshots.delete(terminal)
+      this.netHistory.delete(terminal)
     }
 
     if (patch.rxBytes !== undefined && patch.txBytes !== undefined) {
@@ -1799,8 +2349,8 @@ fi
 
   private parseDisks (value: string): DiskRow[] {
     return String(value || '').split(';').filter(Boolean).map(row => {
-      const [path, used, size, pct] = row.split(',')
-      return { path, used, size, pct: Number(pct || 0) }
+      const [path, avail, size, pct] = row.split(',')
+      return { path, avail, size, pct: Number(pct || 0) }
     })
   }
 
@@ -1819,7 +2369,7 @@ fi
     body.innerHTML = disks.map(d => `
       <tr>
         <td title="${this.escape(d.path)}">${this.escape(d.path)}</td>
-        <td><span>${this.escape(d.used)}/${this.escape(d.size)}</span><i style="width:${Math.max(0, Math.min(100, d.pct))}%"></i></td>
+        <td><span>${this.escape(d.avail)}/${this.escape(d.size)}</span><i style="width:${Math.max(0, Math.min(100, d.pct))}%"></i></td>
       </tr>
     `).join('')
   }
@@ -1936,9 +2486,8 @@ fi
     }
   }
 
-  private setStatus (panel: HTMLElement, kind: CollectorKind, value: string): void {
+  private setStatus (panel: HTMLElement): void {
     panel.querySelector('.tfs-dot')?.classList.remove('on')
-    this.setData(panel, 'status', `${kind}: ${value}`)
   }
 
   private escape (value: string): string {
@@ -1955,6 +2504,10 @@ fi
     return `'${String(value).replace(/'/g, "'\\''")}'`
   }
 
+  private powershellQuote (value: string): string {
+    return `'${String(value).replace(/'/g, "''")}'`
+  }
+
   private injectStyles (): void {
     if (document.getElementById('tabby-status-style')) {
       return
@@ -1963,12 +2516,24 @@ fi
     const style = document.createElement('style')
     style.id = 'tabby-status-style'
     style.textContent = `
+      .tabby-status-layout,
+      .tfs-detail-backdrop,
+      .tfs-context-menu,
+      .tfs-iface-menu {
+        --tfs-bg: var(--theme-background, var(--terminal-background, #1f272a));
+        --tfs-surface: color-mix(in srgb, var(--tfs-bg) 92%, var(--tfs-text-primary) 8%);
+        --tfs-surface-strong: color-mix(in srgb, var(--tfs-bg) 84%, var(--tfs-text-primary) 16%);
+        --tfs-border: color-mix(in srgb, var(--tfs-text-primary) 16%, transparent);
+        --tfs-muted: color-mix(in srgb, var(--tfs-text-primary) 62%, transparent);
+        --tfs-faint: color-mix(in srgb, var(--tfs-text-primary) 38%, transparent);
+        --tfs-text-primary: var(--theme-foreground, var(--terminal-foreground, #d7dee0));
+        --tfs-accent: var(--theme-color, #7fc8ff);
+      }
       .tabby-status-layout {
         position: relative !important;
         box-sizing: border-box !important;
         --tfs-panel-width: 320px;
         --tfs-content-margin: max(0px, 30px * var(--spaciness) - 15px);
-        --tfs-text-primary: #d7dee0;
         transition: none !important;
         animation: none !important;
       }
@@ -1980,9 +2545,9 @@ fi
         width: var(--tfs-panel-width);
         z-index: 20;
         overflow: auto;
-        background: #1f272a;
+        background: var(--tfs-bg);
         color: var(--tfs-text-primary);
-        border-left: 1px solid rgba(255,255,255,.12);
+        border-left: 1px solid var(--tfs-border);
         font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif;
         font-size: 13px;
         line-height: 1.28;
@@ -1998,8 +2563,8 @@ fi
       }
       .tabby-status::-webkit-scrollbar { display: none; }
       .tfs-resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: ew-resize; z-index: 30; }
-      .tfs-resizer::after { content: ""; position: absolute; top: 0; right: 2px; bottom: 0; width: 1px; background: rgba(127,200,255,.16); }
-      .tfs-resizer:hover::after, .tfs-resizing .tfs-resizer::after { width: 2px; background: rgba(127,200,255,.72); }
+      .tfs-resizer::after { content: ""; position: absolute; top: 0; right: 2px; bottom: 0; width: 1px; background: color-mix(in srgb, var(--tfs-accent) 22%, transparent); }
+      .tfs-resizer:hover::after, .tfs-resizing .tfs-resizer::after { width: 2px; background: color-mix(in srgb, var(--tfs-accent) 72%, transparent); }
       .tfs-resizing { cursor: ew-resize !important; user-select: none !important; }
       .tabby-status .tfs-nowrap,
       .tabby-status .tfs-top span,
@@ -2007,7 +2572,6 @@ fi
       .tabby-status .tfs-ip em,
       .tabby-status .tfs-ip strong,
       .tabby-status .tfs-ip button,
-      .tabby-status .tfs-status,
       .tabby-status .tfs-kv span,
       .tabby-status .tfs-kv b,
       .tabby-status .tfs-meter span,
@@ -2022,17 +2586,18 @@ fi
       .tfs-top { font-size: 15px; font-weight: 700; padding-top: 10px; }
       .tfs-dot { width: 8px; height: 8px; border-radius: 50%; background: #6f777a; display: inline-block; }
       .tfs-dot.on { background: #31c66b; box-shadow: 0 0 8px rgba(49,198,107,.5); }
-      .tfs-ip { color: #aeb8bb; }
-      .tfs-ip em { color: #7fc8ff; font-style: normal; font-size: 12px; font-weight: 700; }
-      .tfs-ip strong { flex: 1; font-weight: 600; color: #fff; overflow: hidden; text-overflow: ellipsis; }
-      .tfs-ip button { border: 0; background: transparent; color: #8ea1a7; font-size: 12px; cursor: pointer; }
-      .tfs-status { margin: -1px 10px 4px 52px; color: #8ea1a7; font-size: 11px; overflow: hidden; text-overflow: ellipsis; }
-      .tfs-kv span, .tfs-meter span { color: #91a0a5; }
+      .tfs-ip { color: var(--tfs-muted); }
+      .tfs-ip em { color: var(--tfs-accent); font-style: normal; font-size: 12px; font-weight: 700; }
+      .tfs-ip strong { flex: 1; font-weight: 600; color: var(--tfs-text-primary); overflow: hidden; text-overflow: ellipsis; }
+      .tfs-ip button { border: 0; background: transparent; color: var(--tfs-muted); font-size: 12px; cursor: pointer; }
+      .tfs-ip button.tfs-copy-ok { color: #4fd17f; }
+      .tfs-ip button.tfs-copy-fail { color: #ff8b65; }
+      .tfs-kv span, .tfs-meter span { color: var(--tfs-muted); }
       .tfs-kv span { width: 34px; }
-      .tfs-kv b { font-weight: 500; color: #edf3f5; }
+      .tfs-kv b { font-weight: 500; color: var(--tfs-text-primary); }
       .tfs-meter { display: grid; grid-template-columns: 42px minmax(0, 1fr); align-items: center; column-gap: 8px; padding: 3px 10px; }
       .tfs-meter span { overflow: hidden; text-overflow: ellipsis; }
-      .tfs-meter i { position: relative; height: 15px; border-radius: 999px; background: rgba(255,255,255,.12); overflow: hidden; }
+      .tfs-meter i { position: relative; height: 15px; border-radius: 999px; background: color-mix(in srgb, var(--tfs-text-primary) 13%, transparent); overflow: hidden; }
       .tfs-meter em { position: absolute; inset: 0 auto 0 0; display: block; height: 100%; background: linear-gradient(90deg, #5fb3ff, #31c66b); opacity: .95; }
       .tfs-meter b { text-align: right; color: var(--tfs-text-primary) !important; opacity: 1; font-weight: 600; font-size: 11px; line-height: 15px; font-variant-numeric: tabular-nums; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
       .tfs-meter-value { position: absolute; inset: 0 8px 0 8px; z-index: 1; display: grid; grid-template-columns: 1fr; align-items: center; color: var(--tfs-text-primary) !important; opacity: 1; text-shadow: none; }
@@ -2040,87 +2605,95 @@ fi
       .tfs-meter-value span:last-child { display: none; text-align: right; overflow: hidden; text-overflow: ellipsis; }
       .tfs-meter-value.tfs-meter-no-detail { grid-template-columns: 1fr; }
       .tfs-meter b.tfs-disabled-value { color: var(--tfs-text-primary) !important; opacity: 1; font-weight: 600; }
-      .tfs-section { margin: 10px 10px 5px; color: #7fc8ff; font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }
+      .tfs-section { margin: 10px 10px 5px; color: var(--tfs-accent); font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0; }
       .tfs-clickable { cursor: pointer; }
-      .tfs-clickable:hover { background: rgba(127,200,255,.06); }
+      .tfs-clickable:hover { background: color-mix(in srgb, var(--tfs-accent) 8%, transparent); }
       .tfs-tabs, .tfs-processes div { --tfs-proc-columns: 56px 56px minmax(0, 1fr); }
-      .tfs-tabs { display: grid; grid-template-columns: var(--tfs-proc-columns); column-gap: 8px; color: #8ea1a7; border-top: 1px solid rgba(255,255,255,.08); border-bottom: 1px solid rgba(255,255,255,.08); margin: 0 10px; }
+      .tfs-tabs { display: grid; grid-template-columns: var(--tfs-proc-columns); column-gap: 8px; color: var(--tfs-muted); border-top: 1px solid var(--tfs-border); border-bottom: 1px solid var(--tfs-border); margin: 0 10px; }
       .tfs-tabs button, .tfs-tabs span { padding: 4px 0; font-size: 11px; text-align: left; min-width: 0; }
       .tfs-tabs button { border: 0; background: transparent; color: inherit; font-family: inherit; font-size: 11px; line-height: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
       .tfs-tabs button:hover, .tfs-tabs button.tfs-sort-active { color: var(--tfs-text-primary); }
       .tfs-tabs button.tfs-sort-active { font-weight: 700; }
-      .tfs-tabs button[data-dir="desc"]::after { content: "↓"; color: #7fc8ff; font-size: 10px; }
-      .tfs-tabs button[data-dir="asc"]::after { content: "↑"; color: #7fc8ff; font-size: 10px; }
+      .tfs-tabs button[data-dir="desc"]::after { content: "↓"; color: var(--tfs-accent); font-size: 10px; }
+      .tfs-tabs button[data-dir="asc"]::after { content: "↑"; color: var(--tfs-accent); font-size: 10px; }
       .tfs-tabs button:nth-child(1), .tfs-tabs button:nth-child(2), .tfs-processes span:nth-child(1), .tfs-processes span:nth-child(2) { text-align: left; }
       .tfs-processes { height: 110px; overflow-y: auto; overflow-x: hidden; font-size: 12px; margin: 0 10px; scrollbar-width: none; }
       .tfs-processes::-webkit-scrollbar { display: none; }
-      .tfs-processes div { display: grid; grid-template-columns: var(--tfs-proc-columns); padding: 3px 0; white-space: nowrap; overflow: hidden; border-bottom: 1px solid rgba(255,255,255,.05); column-gap: 8px; }
+      .tfs-processes div { display: grid; grid-template-columns: var(--tfs-proc-columns); padding: 3px 0; white-space: nowrap; overflow: hidden; border-bottom: 1px solid var(--tfs-border); column-gap: 8px; }
       .tfs-processes span { overflow: hidden; text-overflow: ellipsis; min-width: 0; color: var(--tfs-text-primary); opacity: 1; }
       .tfs-processes span:nth-child(1), .tfs-processes span:nth-child(2) { font-variant-numeric: tabular-nums; }
-      .tfs-chart { padding: 4px 10px; border-bottom: 1px solid rgba(255,255,255,.08); }
+      .tfs-chart { padding: 4px 10px; border-bottom: 1px solid var(--tfs-border); }
       .tfs-chart-head { display: grid; align-items: center; gap: 12px; overflow: hidden; }
       .tfs-net-head { grid-template-columns: max-content max-content minmax(52px, 1fr) minmax(32px, 64px); }
       .tfs-lat-head { grid-template-columns: max-content minmax(64px, 1fr); }
       .tfs-chart b { font-weight: 700; color: #4fd17f; font-size: 12px; }
       .tfs-chart b:first-child { color: #ff8b65; }
       .tfs-chart strong { font-weight: 500; color: var(--tfs-text-primary); overflow: hidden; text-overflow: ellipsis; text-align: right; }
-      .tfs-chart p { height: 12px; margin: 0; border-top: 1px dotted rgba(255,255,255,.18); }
-      .tfs-net-bars { height: 38px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
+      .tfs-chart-head button[data-action="iface-picker"] { border: 0; background: transparent; color: var(--tfs-text-primary); padding: 0; font: inherit; font-weight: 500; overflow: hidden; text-overflow: ellipsis; text-align: right; cursor: pointer; }
+      .tfs-chart-head button[data-action="iface-picker"]:hover { color: var(--tfs-accent); }
+      .tfs-chart p { height: 12px; margin: 0; border-top: 1px dotted var(--tfs-border); }
+      .tfs-net-bars { height: 38px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted var(--tfs-border); border-bottom: 1px dotted var(--tfs-border); }
       .tfs-net-bars span { height: 30px; display: flex; align-items: end; justify-content: center; gap: 1px; }
       .tfs-net-bars i { width: 3px; min-height: 2px; border-radius: 2px 2px 0 0; opacity: .9; }
       .tfs-net-bars .tx { background: #ff8b65; }
       .tfs-net-bars .rx { background: #4fd17f; }
-      .tfs-lat b:first-child { color: #7fc8ff; }
-      .tfs-latency-bars { height: 34px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted rgba(255,255,255,.18); border-bottom: 1px dotted rgba(255,255,255,.18); }
-      .tfs-latency-bars span { display: block; min-height: 2px; border-radius: 2px 2px 0 0; background: #7fc8ff; opacity: .9; }
+      .tfs-lat b:first-child { color: var(--tfs-accent); }
+      .tfs-latency-bars { height: 34px; margin: 5px 0 2px; display: grid !important; grid-template-columns: repeat(24, 1fr); align-items: end; gap: 3px !important; border-top: 1px dotted var(--tfs-border); border-bottom: 1px dotted var(--tfs-border); }
+      .tfs-latency-bars span { display: block; min-height: 2px; border-radius: 2px 2px 0 0; background: var(--tfs-accent); opacity: .9; }
       .tfs-idle { opacity: .42; }
       .tabby-status table { width: calc(100% - 20px); margin: 0 10px 10px; border-collapse: collapse; table-layout: fixed; }
-      .tabby-status th { border-bottom: 1px solid rgba(255,255,255,.1); padding: 5px 4px; font-weight: 600; color: #8ea1a7; }
+      .tabby-status th { border-bottom: 1px solid var(--tfs-border); padding: 5px 4px; font-weight: 600; color: var(--tfs-muted); }
       .tabby-status th:last-child { text-align: right; }
       .tabby-status td { position: relative; padding: 3px 5px; color: var(--tfs-text-primary); opacity: 1; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
-      .tabby-status tr:nth-child(even) td { background: rgba(255,255,255,.035); }
+      .tabby-status tr:nth-child(even) td { background: color-mix(in srgb, var(--tfs-text-primary) 4%, transparent); }
       .tabby-status td:first-child { width: 62%; }
       .tabby-status td:last-child { text-align: right; }
-      .tabby-status td:last-child i { position: absolute; top: 0; right: 0; bottom: 0; background: rgba(49, 198, 107, .16); z-index: 0; }
+      .tabby-status td:last-child i { position: absolute; top: 0; right: 0; bottom: 0; background: color-mix(in srgb, #31c66b 22%, transparent); z-index: 0; }
       .tabby-status td:last-child span { position: relative; z-index: 1; }
-      .tfs-detail-backdrop { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: rgba(8,12,14,.58); }
-      .tfs-detail-dialog { width: min(980px, calc(100vw - 56px)); height: min(680px, calc(100vh - 56px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid rgba(127,200,255,.22); background: #1f272a; color: var(--tfs-text-primary); box-shadow: 0 18px 60px rgba(0,0,0,.42); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; }
-      .tfs-detail-top { display: grid; grid-template-columns: max-content 1fr max-content; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid rgba(255,255,255,.1); }
+      .tfs-detail-backdrop { position: fixed; inset: 0; z-index: 9999; display: flex; align-items: center; justify-content: center; background: color-mix(in srgb, var(--tfs-bg) 72%, transparent); color: var(--tfs-text-primary); }
+      .tfs-detail-dialog { width: min(980px, calc(100vw - 56px)); height: min(680px, calc(100vh - 56px)); display: flex; flex-direction: column; overflow: hidden; border: 1px solid color-mix(in srgb, var(--tfs-accent) 28%, transparent); background: var(--tfs-surface); color: var(--tfs-text-primary); box-shadow: 0 18px 60px rgba(0,0,0,.42); font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; font-size: 12px; }
+      .tfs-detail-top { display: grid; grid-template-columns: max-content 1fr max-content; align-items: center; gap: 12px; padding: 10px 12px; border-bottom: 1px solid var(--tfs-border); }
       .tfs-detail-title { display: inline-flex; align-items: center; gap: 6px; min-width: 0; }
-      .tfs-detail-top strong { font-size: 14px; color: #edf3f5; }
-      .tfs-detail-top span { color: #8ea1a7; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
-      .tfs-detail-top button { border: 1px solid rgba(255,255,255,.14); background: rgba(255,255,255,.06); color: var(--tfs-text-primary); padding: 4px 10px; font: inherit; cursor: pointer; }
+      .tfs-detail-top strong { font-size: 14px; color: var(--tfs-text-primary); }
+      .tfs-detail-top span { color: var(--tfs-muted); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tfs-detail-top button { border: 1px solid var(--tfs-border); background: color-mix(in srgb, var(--tfs-text-primary) 7%, transparent); color: var(--tfs-text-primary); padding: 4px 10px; font: inherit; cursor: pointer; }
       .tfs-detail-top .tfs-detail-icon-button { width: 18px; height: 18px; display: inline-grid; place-items: center; padding: 0; border-radius: 4px; background: transparent; }
       .tfs-detail-pause-icon { width: 10px; height: 10px; position: relative; display: block; }
       .tfs-detail-pause-icon::before,
       .tfs-detail-pause-icon::after { content: ""; position: absolute; top: 1px; bottom: 1px; width: 3px; border-radius: 1px; background: currentColor; }
       .tfs-detail-pause-icon::before { left: 1px; }
       .tfs-detail-pause-icon::after { right: 1px; }
-      .tfs-detail-top button.tfs-detail-paused { border-color: rgba(127,200,255,.34); background: rgba(127,200,255,.1); color: #edf3f5; }
+      .tfs-detail-top button.tfs-detail-paused { border-color: color-mix(in srgb, var(--tfs-accent) 42%, transparent); background: color-mix(in srgb, var(--tfs-accent) 12%, transparent); color: var(--tfs-text-primary); }
       .tfs-detail-top button.tfs-detail-paused .tfs-detail-pause-icon::before { top: 1px; left: 3px; bottom: auto; width: 0; height: 0; border-radius: 0; background: transparent; border-top: 4px solid transparent; border-bottom: 4px solid transparent; border-left: 7px solid currentColor; }
       .tfs-detail-top button.tfs-detail-paused .tfs-detail-pause-icon::after { display: none; }
-      .tfs-detail-body { flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: rgba(127,200,255,.42) rgba(255,255,255,.06); }
+      .tfs-detail-body { flex: 1; overflow: auto; scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--tfs-accent) 42%, transparent) color-mix(in srgb, var(--tfs-text-primary) 7%, transparent); }
       .tfs-detail-body::-webkit-scrollbar { width: 8px; height: 8px; }
-      .tfs-detail-body::-webkit-scrollbar-track { background: rgba(255,255,255,.06); }
-      .tfs-detail-body::-webkit-scrollbar-thumb { background: rgba(127,200,255,.42); border-radius: 8px; }
-      .tfs-detail-body::-webkit-scrollbar-thumb:hover { background: rgba(127,200,255,.62); }
+      .tfs-detail-body::-webkit-scrollbar-track { background: color-mix(in srgb, var(--tfs-text-primary) 7%, transparent); }
+      .tfs-detail-body::-webkit-scrollbar-thumb { background: color-mix(in srgb, var(--tfs-accent) 42%, transparent); border-radius: 8px; }
+      .tfs-detail-body::-webkit-scrollbar-thumb:hover { background: color-mix(in srgb, var(--tfs-accent) 62%, transparent); }
       .tfs-detail-table { border-collapse: collapse; table-layout: fixed; }
-      .tfs-detail-table th, .tfs-detail-table td { padding: 7px 8px; border-bottom: 1px solid rgba(255,255,255,.07); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
-      .tfs-detail-table th { position: sticky; top: 0; z-index: 1; background: #232c2f; color: #8ea1a7; font-weight: 600; }
+      .tfs-detail-table th, .tfs-detail-table td { padding: 7px 8px; border-bottom: 1px solid var(--tfs-border); white-space: nowrap; overflow: hidden; text-overflow: ellipsis; text-align: left; }
+      .tfs-detail-table th { position: sticky; top: 0; z-index: 1; background: var(--tfs-surface-strong); color: var(--tfs-muted); font-weight: 600; }
       .tfs-detail-table th.tfs-resizable-col { position: sticky; }
       .tfs-detail-table td { color: var(--tfs-text-primary); font-variant-numeric: tabular-nums; }
-      .tfs-detail-table tr:nth-child(even) td { background: rgba(255,255,255,.025); }
+      .tfs-detail-table tr:nth-child(even) td { background: color-mix(in srgb, var(--tfs-text-primary) 3%, transparent); }
       .tfs-detail-table th button { border: 0; background: transparent; color: inherit; padding: 0; font: inherit; cursor: pointer; display: inline-flex; align-items: center; gap: 4px; }
-      .tfs-detail-table th button:hover, .tfs-detail-table th button.tfs-sort-active { color: #edf3f5; }
-      .tfs-detail-table th button[data-dir="desc"]::after { content: "↓"; color: #7fc8ff; font-size: 10px; }
-      .tfs-detail-table th button[data-dir="asc"]::after { content: "↑"; color: #7fc8ff; font-size: 10px; }
+      .tfs-detail-table th button:hover, .tfs-detail-table th button.tfs-sort-active { color: var(--tfs-text-primary); }
+      .tfs-detail-table th button[data-dir="desc"]::after { content: "↓"; color: var(--tfs-accent); font-size: 10px; }
+      .tfs-detail-table th button[data-dir="asc"]::after { content: "↑"; color: var(--tfs-accent); font-size: 10px; }
+      .tfs-detail-empty-row td { height: 34px; color: transparent; }
+      .tfs-detail-empty-row:nth-child(even) td { background: color-mix(in srgb, var(--tfs-text-primary) 2%, transparent) !important; }
+      .tfs-detail-skeleton { display: block; height: 10px; border-radius: 2px; background: linear-gradient(90deg, color-mix(in srgb, var(--tfs-muted) 28%, transparent), color-mix(in srgb, var(--tfs-accent) 18%, transparent)); opacity: .72; }
       .tfs-col-resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: col-resize; }
-      .tfs-col-resizer::after { content: ""; position: absolute; top: 6px; right: 3px; bottom: 6px; width: 1px; background: rgba(127,200,255,.2); }
-      .tfs-col-resizer:hover::after, .tfs-col-resizing .tfs-col-resizer::after { background: rgba(127,200,255,.72); }
+      .tfs-col-resizer::after { content: ""; position: absolute; top: 6px; right: 3px; bottom: 6px; width: 1px; background: color-mix(in srgb, var(--tfs-accent) 24%, transparent); }
+      .tfs-col-resizer:hover::after, .tfs-col-resizing .tfs-col-resizer::after { background: color-mix(in srgb, var(--tfs-accent) 72%, transparent); }
       .tfs-col-resizing { cursor: col-resize !important; user-select: none !important; }
-      .tfs-context-menu { position: fixed; z-index: 10000; min-width: 132px; padding: 5px; border: 1px solid rgba(127,200,255,.24); background: #232c2f; box-shadow: 0 12px 32px rgba(0,0,0,.38); }
+      .tfs-context-menu { position: fixed; z-index: 10000; min-width: 132px; padding: 5px; border: 1px solid color-mix(in srgb, var(--tfs-accent) 28%, transparent); background: var(--tfs-surface); color: var(--tfs-text-primary); box-shadow: 0 12px 32px rgba(0,0,0,.38); }
       .tfs-context-menu button { display: block; width: 100%; border: 0; background: transparent; color: var(--tfs-text-primary); padding: 6px 9px; text-align: left; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; cursor: pointer; }
-      .tfs-context-menu button:hover { background: rgba(127,200,255,.12); color: #edf3f5; }
+      .tfs-context-menu button:hover { background: color-mix(in srgb, var(--tfs-accent) 12%, transparent); color: var(--tfs-text-primary); }
+      .tfs-iface-menu { position: fixed; z-index: 10000; min-width: 140px; max-width: 180px; max-height: 260px; overflow: auto; padding: 5px; border: 1px solid color-mix(in srgb, var(--tfs-accent) 28%, transparent); background: var(--tfs-surface); color: var(--tfs-text-primary); box-shadow: 0 12px 32px rgba(0,0,0,.38); scrollbar-width: thin; scrollbar-color: color-mix(in srgb, var(--tfs-accent) 42%, transparent) color-mix(in srgb, var(--tfs-text-primary) 7%, transparent); }
+      .tfs-iface-menu button { display: block; width: 100%; border: 0; background: transparent; color: var(--tfs-text-primary); padding: 6px 9px; text-align: left; font: 12px -apple-system, BlinkMacSystemFont, "Segoe UI", "Microsoft YaHei", sans-serif; cursor: pointer; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+      .tfs-iface-menu button:hover, .tfs-iface-menu button.active { background: color-mix(in srgb, var(--tfs-accent) 12%, transparent); color: var(--tfs-text-primary); }
     `
     document.head.appendChild(style)
   }

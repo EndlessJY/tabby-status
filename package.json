@@ -11,8 +11,8 @@
   "scripts": {
     "build": "node node_modules/webpack/bin/webpack.js --mode production",
     "dev": "node node_modules/webpack/bin/webpack.js --mode development --watch",
-    "pack:plugin": "npm run build && mkdir -p release && npm pack --pack-destination release",
-    "install-local": "npm run build && TARBALL=$(npm pack --silent) && npm install --prefix \"$HOME/Library/Application Support/tabby/plugins\" --omit=dev --legacy-peer-deps \"./$TARBALL\"",
+    "pack:plugin": "npm run build && node scripts/pack-plugin.mjs",
+    "install-local": "npm run build && node scripts/install-local.mjs",
     "test:smoke": "npm run build && node tests/smoke.mjs"
   },
   "files": [
