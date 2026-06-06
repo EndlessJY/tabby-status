@@ -143,6 +143,18 @@ type TimerHandle = {
   kind: 'interval' | 'timeout'
 }
 
+type ThemeColors = {
+  background: string
+  foreground: string
+  accent: string
+}
+
+type ThemeSyncState = {
+  observer?: MutationObserver
+  interval?: number
+  lastSignature?: string
+}
+
 @Injectable()
 export class TabbyStatusDecorator extends TerminalDecorator {
   private readonly panelWidthStorageKey = 'tabby-status-width'
@@ -163,6 +175,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
   private detailModals = new WeakMap<BaseTerminalTabComponent<any>, DetailModalState>()
   private detailSort = new WeakMap<BaseTerminalTabComponent<any>, DetailSortState>()
   private networkIfaceSelection = new WeakMap<BaseTerminalTabComponent<any>, string>()
+  private themeSyncs = new WeakMap<BaseTerminalTabComponent<any>, ThemeSyncState>()
 
   attach (terminal: BaseTerminalTabComponent<any>): void {
     super.attach(terminal)
@@ -188,8 +201,10 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     this.clearScheduledCollectors(terminal)
     this.panels.get(terminal)?.remove()
     const host = this.hosts.get(terminal)
+    this.clearThemeSync(terminal)
     host?.classList.remove('tabby-status-layout')
     host?.style.removeProperty('--tfs-panel-width')
+    this.clearThemeVars(host)
     this.panels.delete(terminal)
     this.hosts.delete(terminal)
     this.collectorGenerations.delete(terminal)
@@ -551,6 +566,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
 
     const menu = document.createElement('div')
     menu.className = 'tfs-iface-menu'
+    this.applyCurrentThemeToOverlay(terminal, menu)
     menu.innerHTML = [
       `<button type="button" data-iface="" class="${current ? '' : 'active'}">自动</button>`,
       ...uniqueIfaces.map(iface => `<button type="button" data-iface="${this.escape(iface)}" class="${iface === current ? 'active' : ''}">${this.escape(iface)}</button>`),
@@ -621,6 +637,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
 
     const modal = document.createElement('div')
     modal.className = 'tfs-detail-backdrop'
+    this.applyCurrentThemeToOverlay(terminal, modal)
     modal.innerHTML = `
       <div class="tfs-detail-dialog" role="dialog" aria-modal="true">
         <div class="tfs-detail-top">
@@ -811,6 +828,7 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     const location = row.dataset.processLocation || ''
     const menu = document.createElement('div')
     menu.className = 'tfs-context-menu'
+    this.applyCurrentThemeToOverlay(terminal, menu)
     menu.style.left = `${x}px`
     menu.style.top = `${y}px`
     menu.innerHTML = `
@@ -2081,7 +2099,210 @@ fi
     layoutHost.appendChild(panel)
     this.hosts.set(terminal, layoutHost)
     this.bindPanelResize(terminal, layoutHost, panel)
+    this.bindThemeSync(terminal, layoutHost, panel, terminalElement)
     this.scheduleTerminalResize(terminal)
+  }
+
+  private bindThemeSync (terminal: BaseTerminalTabComponent<any>, host: HTMLElement, panel: HTMLElement, terminalElement: HTMLElement): void {
+    this.clearThemeSync(terminal)
+    const state: ThemeSyncState = {}
+    this.themeSyncs.set(terminal, state)
+    const refresh = () => this.syncThemeVars(terminal, host, panel, terminalElement)
+
+    refresh()
+    window.requestAnimationFrame(refresh)
+    window.setTimeout(refresh, 80)
+
+    if (typeof MutationObserver !== 'undefined') {
+      const observer = new MutationObserver(refresh)
+      for (const node of this.uniqueElements([document.documentElement, document.body, terminalElement, host])) {
+        observer.observe(node, { attributes: true, attributeFilter: ['class', 'style', 'data-theme'] })
+      }
+      state.observer = observer
+    }
+
+    state.interval = window.setInterval(refresh, 1000)
+  }
+
+  private clearThemeSync (terminal: BaseTerminalTabComponent<any>): void {
+    const state = this.themeSyncs.get(terminal)
+    if (!state) {
+      return
+    }
+    state.observer?.disconnect()
+    if (state.interval !== undefined) {
+      window.clearInterval(state.interval)
+    }
+    this.themeSyncs.delete(terminal)
+  }
+
+  private syncThemeVars (terminal: BaseTerminalTabComponent<any>, host: HTMLElement, panel: HTMLElement, terminalElement: HTMLElement): void {
+    const state = this.themeSyncs.get(terminal)
+    const colors = this.resolveThemeColors(host, panel, terminalElement)
+    const signature = `${colors.background}|${colors.foreground}|${colors.accent}`
+    if (state?.lastSignature === signature) {
+      return
+    }
+    if (state) {
+      state.lastSignature = signature
+    }
+    this.applyThemeVars(host, colors)
+
+    const detail = this.detailModals.get(terminal)
+    if (detail) {
+      this.applyThemeVars(detail.modal, colors)
+    }
+    for (const overlay of Array.from(document.querySelectorAll<HTMLElement>('.tfs-context-menu, .tfs-iface-menu'))) {
+      this.applyThemeVars(overlay, colors)
+    }
+  }
+
+  private resolveThemeColors (host: HTMLElement, panel: HTMLElement, terminalElement: HTMLElement): ThemeColors {
+    const candidates = this.getThemeCandidates(host, panel, terminalElement)
+    const background = this.firstThemeCustomColor(candidates, ['--theme-background', '--terminal-background', '--background-color', '--body-bg-color']) ||
+      this.firstComputedColor(candidates, 'backgroundColor') ||
+      '#1f272a'
+    const foreground = this.firstThemeCustomColor(candidates, ['--theme-foreground', '--terminal-foreground', '--foreground-color', '--body-color']) ||
+      this.firstComputedColor(candidates, 'color') ||
+      (this.isLightColor(background) ? '#1f2933' : '#d7dee0')
+    const accent = this.firstThemeCustomColor(candidates, ['--theme-color', '--theme-primary', '--color-primary', '--color-accent', '--accent-color']) ||
+      (this.isLightColor(background) ? '#2563eb' : '#7fc8ff')
+
+    return { background, foreground, accent }
+  }
+
+  private getThemeCandidates (host: HTMLElement, panel: HTMLElement, terminalElement: HTMLElement): HTMLElement[] {
+    const selectors = [
+      '.xterm-viewport',
+      '.xterm-screen',
+      '.xterm-rows',
+      '.xterm',
+      '.terminal',
+      '.content',
+    ]
+    const candidates: HTMLElement[] = []
+    const add = (node: Element | null | undefined) => {
+      if (node instanceof HTMLElement && node !== panel && !panel.contains(node)) {
+        candidates.push(node)
+      }
+    }
+
+    for (const selector of selectors) {
+      add(terminalElement.querySelector(selector))
+      add(host.querySelector(selector))
+    }
+    add(terminalElement)
+    add(host.querySelector('.content'))
+    add(host)
+    add(host.parentElement)
+    add(document.body)
+    add(document.documentElement)
+
+    return this.uniqueElements(candidates)
+  }
+
+  private uniqueElements (elements: Array<HTMLElement | null | undefined>): HTMLElement[] {
+    const seen = new Set<HTMLElement>()
+    const unique: HTMLElement[] = []
+    for (const element of elements) {
+      if (!element || seen.has(element)) {
+        continue
+      }
+      seen.add(element)
+      unique.push(element)
+    }
+    return unique
+  }
+
+  private firstThemeCustomColor (elements: HTMLElement[], names: string[]): string {
+    for (const element of elements) {
+      const style = window.getComputedStyle(element)
+      for (const name of names) {
+        const value = style.getPropertyValue(name).trim()
+        if (this.isUsableColor(value)) {
+          return value
+        }
+      }
+    }
+    return ''
+  }
+
+  private firstComputedColor (elements: HTMLElement[], property: 'backgroundColor' | 'color'): string {
+    for (const element of elements) {
+      const value = window.getComputedStyle(element)[property]
+      if (this.isUsableColor(value)) {
+        return value
+      }
+    }
+    return ''
+  }
+
+  private isUsableColor (value: string): boolean {
+    const normalized = String(value || '').trim().toLowerCase()
+    return Boolean(normalized) &&
+      normalized !== 'transparent' &&
+      !normalized.startsWith('var(') &&
+      !normalized.includes('rgba(0, 0, 0, 0)') &&
+      !normalized.includes('rgba(0,0,0,0)')
+  }
+
+  private isLightColor (value: string): boolean {
+    const rgb = this.parseRgbColor(value)
+    if (!rgb) {
+      return false
+    }
+    return ((rgb.r * 299) + (rgb.g * 587) + (rgb.b * 114)) / 1000 > 170
+  }
+
+  private parseRgbColor (value: string): { r: number, g: number, b: number } | undefined {
+    const hex = String(value).trim().match(/^#([0-9a-f]{3}|[0-9a-f]{6})$/i)
+    if (hex) {
+      const raw = hex[1]
+      const full = raw.length === 3 ? raw.split('').map(char => `${char}${char}`).join('') : raw
+      return {
+        r: parseInt(full.slice(0, 2), 16),
+        g: parseInt(full.slice(2, 4), 16),
+        b: parseInt(full.slice(4, 6), 16),
+      }
+    }
+
+    const rgb = String(value).match(/rgba?\(\s*([0-9.]+)\s*,\s*([0-9.]+)\s*,\s*([0-9.]+)/i)
+    if (!rgb) {
+      return undefined
+    }
+    return {
+      r: Number(rgb[1]),
+      g: Number(rgb[2]),
+      b: Number(rgb[3]),
+    }
+  }
+
+  private applyThemeVars (element: HTMLElement, colors: ThemeColors): void {
+    element.style.setProperty('--tfs-bg', colors.background)
+    element.style.setProperty('--tfs-text-primary', colors.foreground)
+    element.style.setProperty('--tfs-accent', colors.accent)
+  }
+
+  private applyCurrentThemeToOverlay (terminal: BaseTerminalTabComponent<any>, overlay: HTMLElement): void {
+    const host = this.hosts.get(terminal)
+    if (!host) {
+      return
+    }
+    const background = host.style.getPropertyValue('--tfs-bg').trim()
+    const foreground = host.style.getPropertyValue('--tfs-text-primary').trim()
+    const accent = host.style.getPropertyValue('--tfs-accent').trim()
+    if (background && foreground && accent) {
+      this.applyThemeVars(overlay, { background, foreground, accent })
+    }
+  }
+
+  private clearThemeVars (element?: HTMLElement): void {
+    if (!element) {
+      return
+    }
+    element.style.removeProperty('--tfs-bg')
+    element.style.removeProperty('--tfs-text-primary')
+    element.style.removeProperty('--tfs-accent')
   }
 
   private bindPanelResize (terminal: BaseTerminalTabComponent<any>, host: HTMLElement, panel: HTMLElement): void {
