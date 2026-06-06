@@ -24,7 +24,7 @@ Tabby SSH 系统状态侧边面板插件，提供服务器信息展示。
 
 只支持 zip 安装。
 
-1. 从 GitHub Actions Artifacts 或 GitHub Release 下载 `tabby-status-<version>.zip`。
+1. 从 GitHub Releases 的 `latest` Release 下载 `tabby-status-<version>.zip`。
 2. 完全退出 Tabby。
 3. 解压 zip，得到 `tabby-status` 文件夹。
 4. 把 `tabby-status` 文件夹复制到 Tabby 插件目录：
@@ -66,7 +66,7 @@ GitHub Actions 只构建 zip 产物：
 release/tabby-status-<version>.zip
 ```
 
-该 zip 内部只包含运行插件需要的文件，不包含开发依赖。
+每次提交到 `main` 后，GitHub Actions 会自动构建 zip，并更新 GitHub Releases 页面里的 `latest` Release 资产。推送 `v*` tag 时，会创建对应版本 Release。该 zip 内部只包含运行插件需要的文件，不包含开发依赖。
 
 ## 已知限制
 
