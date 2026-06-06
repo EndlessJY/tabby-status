@@ -158,8 +158,10 @@ type ThemeSyncState = {
 @Injectable()
 export class TabbyStatusDecorator extends TerminalDecorator {
   private readonly panelWidthStorageKey = 'tabby-status-width'
+  private readonly panelCollapsedStorageKey = 'tabby-status-collapsed'
   private readonly minPanelWidth = 260
   private readonly maxPanelWidth = 560
+  private readonly collapsedPanelWidth = 32
   private panels = new WeakMap<BaseTerminalTabComponent<any>, HTMLElement>()
   private hosts = new WeakMap<BaseTerminalTabComponent<any>, HTMLElement>()
   private timers = new WeakMap<BaseTerminalTabComponent<any>, TimerHandle[]>()
@@ -175,6 +177,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
   private detailModals = new WeakMap<BaseTerminalTabComponent<any>, DetailModalState>()
   private detailSort = new WeakMap<BaseTerminalTabComponent<any>, DetailSortState>()
   private networkIfaceSelection = new WeakMap<BaseTerminalTabComponent<any>, string>()
+  private pinnedPublicIps = new WeakMap<BaseTerminalTabComponent<any>, string>()
   private themeSyncs = new WeakMap<BaseTerminalTabComponent<any>, ThemeSyncState>()
 
   attach (terminal: BaseTerminalTabComponent<any>): void {
@@ -203,7 +206,9 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     const host = this.hosts.get(terminal)
     this.clearThemeSync(terminal)
     host?.classList.remove('tabby-status-layout')
+    host?.classList.remove('tabby-status-collapsed', 'tfs-panel-toggling')
     host?.style.removeProperty('--tfs-panel-width')
+    host?.style.removeProperty('--tfs-panel-active-width')
     this.clearThemeVars(host)
     this.panels.delete(terminal)
     this.hosts.delete(terminal)
@@ -217,6 +222,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     this.latencyHistory.delete(terminal)
     this.processSort.delete(terminal)
     this.networkIfaceSelection.delete(terminal)
+    this.pinnedPublicIps.delete(terminal)
     this.closeDetailModal(terminal)
     this.closeIfaceMenu()
     this.detailSort.delete(terminal)
@@ -232,10 +238,12 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     const sessionChanged = !this.sessionKeys.has(terminal) || this.sessionKeys.get(terminal) !== sessionKey
     this.sessionKeys.set(terminal, sessionKey)
     if (sessionChanged) {
+      this.state.delete(terminal)
       this.cpuSnapshots.delete(terminal)
       this.netSnapshots.delete(terminal)
       this.netHistory.delete(terminal)
       this.latencyHistory.delete(terminal)
+      this.pinnedPublicIps.delete(terminal)
     }
 
     const fastLaunch = () => {
@@ -250,7 +258,7 @@ export class TabbyStatusDecorator extends TerminalDecorator {
     }
     const slowLaunch = () => {
       if (this.collectorGenerations.get(terminal) === generation) {
-        void this.collectViaSshExec(terminal, 'slow', this.slowCollectorExecCommand(), generation)
+        void this.collectViaSshExec(terminal, 'slow', this.slowCollectorExecCommand(this.pinnedPublicIps.get(terminal) || ''), generation)
       }
     }
 
@@ -422,9 +430,9 @@ fi | awk 'NR>1 && $4 !~ /^(ps|awk|sh|bash)$/ {printf "proc\t%s\t%s\t%s\t%s\n", $
     return this.encodeShellScript(script)
   }
 
-  private slowCollectorExecCommand (): string {
+  private slowCollectorExecCommand (pinnedPublicIp = ''): string {
     const script = String.raw`os=$(uname -s 2>/dev/null)
-publicIp=""
+publicIp=__TABBY_STATUS_PINNED_PUBLIC_IP__
 localIp=""
 if [ "$os" = "Darwin" ]; then
   iface=$(route -n get default 2>/dev/null | awk '/interface:/{print $2; exit}')
@@ -447,11 +455,13 @@ fetch_public_ip() {
     wget -qO- -T 1 "$url" 2>/dev/null | tr -d '[:space:]'
   fi
 }
+if [ -z "$publicIp" ]; then
 for url in https://api.ipify.org https://ifconfig.me/ip https://icanhazip.com https://checkip.amazonaws.com; do
   [ -n "$publicIp" ] && break
   publicIp=$(fetch_public_ip "$url")
   case "$publicIp" in *.*) ;; *) publicIp="" ;; esac
 done
+fi
 ipaddr="$publicIp"
 [ -z "$ipaddr" ] && ipaddr="$localIp"
 printf 'ip\t%s\n' "$ipaddr"
@@ -460,7 +470,7 @@ printf 'localIp\t%s\n' "$localIp"
 printf 'uptime\t%s\n' "$up"
 df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n", $6,$4,$2,$5}' | head -40
 `
-    return this.encodeShellScript(script)
+    return this.encodeShellScript(script.replace('__TABBY_STATUS_PINNED_PUBLIC_IP__', this.shellQuote(pinnedPublicIp)))
   }
 
   private encodeShellScript (script: string): string {
@@ -473,22 +483,25 @@ df -P -h 2>/dev/null | awk 'NR>1{gsub("%","",$5); printf "disk\t%s\t%s\t%s\t%s\n
     const panel = document.createElement('div')
     panel.className = 'tabby-status'
     panel.innerHTML = `
-      <div class="tfs-top"><span>系统监控</span><span class="tfs-dot"></span></div>
-      <div class="tfs-ip"><span>IP</span><em data-k="ip-type">-</em><strong>等待连接</strong><button>复制</button></div>
-      <div class="tfs-kv"><span>运行</span><b data-k="uptime">-</b></div>
-      <div class="tfs-kv"><span>负载</span><b data-k="load">-</b></div>
-      <div class="tfs-meter"><span>CPU</span><i><em data-bar="cpu"></em><b class="tfs-meter-value" data-meter="cpu"><span data-k="cpu-pct"></span><span data-k="cpu-detail"></span></b></i></div>
-      <div class="tfs-meter"><span>内存</span><i><em data-bar="mem"></em><b class="tfs-meter-value" data-meter="mem"><span data-k="mem-pct">-</span><span data-k="mem-detail"></span></b></i></div>
-      <div class="tfs-meter"><span>交换</span><i><em data-bar="swap"></em><b class="tfs-meter-value" data-meter="swap"><span data-k="swap-pct">-</span><span data-k="swap-detail"></span></b></i></div>
-      <div class="tfs-section tfs-clickable" data-open-detail="process" title="打开进程详情">进程</div>
-      <div class="tfs-tabs"><button type="button" data-sort="mem" aria-pressed="false" title="按内存排序">内存</button><button type="button" data-sort="cpu" aria-pressed="false" title="按 CPU 排序">CPU</button><span>命令</span></div>
-      <div class="tfs-processes tfs-clickable" data-open-detail="process" data-k="processes" title="打开进程详情"></div>
-      <div class="tfs-section tfs-clickable" data-open-detail="network" title="打开网络详情">网络</div>
-      <div class="tfs-chart tfs-clickable" data-open-detail="network" title="打开网络详情"><div class="tfs-chart-head tfs-net-head tfs-nowrap"><b data-k="tx">0B/s</b><b data-k="rx">0B/s</b><strong data-k="net-peak">峰值 -</strong><button type="button" data-action="iface-picker" data-k="iface" title="切换网卡">-</button></div><div class="tfs-net-bars tfs-idle" data-k="net-bars"></div></div>
-      <div class="tfs-chart tfs-lat tfs-clickable" data-open-detail="latency" title="打开延迟详情"><div class="tfs-chart-head tfs-lat-head tfs-nowrap"><b data-k="latency">0ms</b><strong data-k="latency-peak">延迟 -</strong></div><div class="tfs-latency-bars tfs-idle" data-k="latency-bars"></div></div>
-      <div class="tfs-section">磁盘</div>
-      <table><thead><tr><th>路径</th><th>可用/大小</th></tr></thead><tbody data-k="disks"></tbody></table>
-      <div class="tfs-resizer" title="拖动调整面板宽度"></div>
+      <div class="tfs-panel-body">
+        <div class="tfs-top"><span>系统监控</span><span class="tfs-dot"></span></div>
+        <div class="tfs-ip"><span>IP</span><em data-k="ip-type">-</em><strong>等待连接</strong><button>复制</button></div>
+        <div class="tfs-kv"><span>运行</span><b data-k="uptime">-</b></div>
+        <div class="tfs-kv"><span>负载</span><b data-k="load">-</b></div>
+        <div class="tfs-meter"><span>CPU</span><i><em data-bar="cpu"></em><b class="tfs-meter-value" data-meter="cpu"><span data-k="cpu-pct"></span><span data-k="cpu-detail"></span></b></i></div>
+        <div class="tfs-meter"><span>内存</span><i><em data-bar="mem"></em><b class="tfs-meter-value" data-meter="mem"><span data-k="mem-pct">-</span><span data-k="mem-detail"></span></b></i></div>
+        <div class="tfs-meter"><span>交换</span><i><em data-bar="swap"></em><b class="tfs-meter-value" data-meter="swap"><span data-k="swap-pct">-</span><span data-k="swap-detail"></span></b></i></div>
+        <div class="tfs-section tfs-clickable" data-open-detail="process" title="打开进程详情">进程</div>
+        <div class="tfs-tabs"><button type="button" data-sort="mem" aria-pressed="false" title="按内存排序">内存</button><button type="button" data-sort="cpu" aria-pressed="false" title="按 CPU 排序">CPU</button><span>命令</span></div>
+        <div class="tfs-processes tfs-clickable" data-open-detail="process" data-k="processes" title="打开进程详情"></div>
+        <div class="tfs-section tfs-clickable" data-open-detail="network" title="打开网络详情">网络</div>
+        <div class="tfs-chart tfs-clickable" data-open-detail="network" title="打开网络详情"><div class="tfs-chart-head tfs-net-head tfs-nowrap"><b data-k="tx">0B/s</b><b data-k="rx">0B/s</b><strong data-k="net-peak">峰值 -</strong><button type="button" data-action="iface-picker" data-k="iface" title="切换网卡">-</button></div><div class="tfs-net-bars tfs-idle" data-k="net-bars"></div></div>
+        <div class="tfs-chart tfs-lat tfs-clickable" data-open-detail="latency" title="打开延迟详情"><div class="tfs-chart-head tfs-lat-head tfs-nowrap"><b data-k="latency">0ms</b><strong data-k="latency-peak">延迟 -</strong></div><div class="tfs-latency-bars tfs-idle" data-k="latency-bars"></div></div>
+        <div class="tfs-section">磁盘</div>
+        <table><thead><tr><th>路径</th><th>可用/大小</th></tr></thead><tbody data-k="disks"></tbody></table>
+        <div class="tfs-resizer" title="拖动调整面板宽度"></div>
+      </div>
+      <button type="button" class="tfs-collapse-toggle" data-action="panel-collapse" title="收起状态面板" aria-label="收起状态面板" aria-expanded="true"><span class="tfs-collapse-icon" aria-hidden="true"></span></button>
     `
 
     panel.querySelector<HTMLButtonElement>('.tfs-ip button')?.addEventListener('click', async event => {
@@ -2098,6 +2111,8 @@ fi
     this.setPanelWidth(layoutHost, this.getSavedPanelWidth())
     layoutHost.appendChild(panel)
     this.hosts.set(terminal, layoutHost)
+    this.bindPanelCollapse(terminal, layoutHost, panel)
+    this.setPanelCollapsed(terminal, layoutHost, panel, this.getSavedPanelCollapsed(), false, false)
     this.bindPanelResize(terminal, layoutHost, panel)
     this.bindThemeSync(terminal, layoutHost, panel, terminalElement)
     this.scheduleTerminalResize(terminal)
@@ -2338,8 +2353,21 @@ fi
     })
   }
 
+  private bindPanelCollapse (terminal: BaseTerminalTabComponent<any>, host: HTMLElement, panel: HTMLElement): void {
+    const button = panel.querySelector<HTMLButtonElement>('button[data-action="panel-collapse"]')
+    button?.addEventListener('click', event => {
+      event.preventDefault()
+      event.stopPropagation()
+      this.setPanelCollapsed(terminal, host, panel, !host.classList.contains('tabby-status-collapsed'), true, true)
+    })
+  }
+
   private getSavedPanelWidth (): number {
     return this.clampPanelWidth(Number(window.localStorage?.getItem(this.panelWidthStorageKey) || 320))
+  }
+
+  private getSavedPanelCollapsed (): boolean {
+    return window.localStorage?.getItem(this.panelCollapsedStorageKey) === '1'
   }
 
   private readPanelWidth (host: HTMLElement): number {
@@ -2348,6 +2376,34 @@ fi
 
   private setPanelWidth (host: HTMLElement, width: number): void {
     host.style.setProperty('--tfs-panel-width', `${this.clampPanelWidth(width)}px`)
+    host.style.setProperty('--tfs-panel-rail-width', `${this.collapsedPanelWidth}px`)
+  }
+
+  private setPanelCollapsed (terminal: BaseTerminalTabComponent<any>, host: HTMLElement, panel: HTMLElement, collapsed: boolean, persist = true, animate = true): void {
+    if (animate) {
+      host.classList.add('tfs-panel-toggling')
+      void host.offsetWidth
+    } else {
+      host.classList.remove('tfs-panel-toggling')
+    }
+    host.classList.toggle('tabby-status-collapsed', collapsed)
+    const button = panel.querySelector<HTMLButtonElement>('button[data-action="panel-collapse"]')
+    if (button) {
+      const label = collapsed ? '展开状态面板' : '收起状态面板'
+      button.title = label
+      button.setAttribute('aria-label', label)
+      button.setAttribute('aria-expanded', String(!collapsed))
+    }
+    if (persist) {
+      window.localStorage?.setItem(this.panelCollapsedStorageKey, collapsed ? '1' : '0')
+    }
+    this.scheduleTerminalResize(terminal)
+    if (animate) {
+      window.setTimeout(() => {
+        host.classList.remove('tfs-panel-toggling')
+        this.scheduleTerminalResize(terminal)
+      }, 240)
+    }
   }
 
   private scheduleTerminalResize (terminal: BaseTerminalTabComponent<any>): void {
@@ -2465,6 +2521,10 @@ fi
   private mergeMetricPatch (terminal: BaseTerminalTabComponent<any>, patch: any): any {
     const current = this.state.get(terminal) ?? {}
     const next = { ...current, ...patch }
+    const stablePublicIp = this.resolveStablePublicIp(terminal, current, patch)
+    if (stablePublicIp) {
+      next.publicIp = stablePublicIp
+    }
 
     if (patch.cpuBusy !== undefined && patch.cpuTotal !== undefined) {
       const busy = Number(patch.cpuBusy || 0)
@@ -2534,6 +2594,18 @@ fi
     delete next.kind
     this.state.set(terminal, next)
     return next
+  }
+
+  private resolveStablePublicIp (terminal: BaseTerminalTabComponent<any>, current: any, patch: any): string {
+    const pinned = this.pinnedPublicIps.get(terminal)
+    if (pinned) {
+      return pinned
+    }
+    const publicIp = String(patch.publicIp || current.publicIp || '').trim()
+    if (publicIp) {
+      this.pinnedPublicIps.set(terminal, publicIp)
+    }
+    return publicIp
   }
 
   private formatBytesPerSecond (value: number): string {
@@ -2754,18 +2826,23 @@ fi
         position: relative !important;
         box-sizing: border-box !important;
         --tfs-panel-width: 320px;
+        --tfs-panel-rail-width: 32px;
+        --tfs-panel-active-width: var(--tfs-panel-width);
         --tfs-content-margin: max(0px, 30px * var(--spaciness) - 15px);
         transition: none !important;
         animation: none !important;
+      }
+      .tabby-status-layout.tabby-status-collapsed {
+        --tfs-panel-active-width: var(--tfs-panel-rail-width);
       }
       .tabby-status {
         position: absolute;
         top: 0;
         left: 0;
         bottom: 0;
-        width: var(--tfs-panel-width);
+        width: var(--tfs-panel-active-width);
         z-index: 20;
-        overflow: auto;
+        overflow: visible;
         background: var(--tfs-bg);
         color: var(--tfs-text-primary);
         border-left: 1px solid var(--tfs-border);
@@ -2775,17 +2852,106 @@ fi
         box-sizing: border-box;
         scrollbar-width: none;
       }
+      .tfs-panel-body {
+        position: absolute;
+        inset: 0;
+        min-width: var(--tfs-panel-width);
+        overflow: auto;
+        scrollbar-width: none;
+        transition: none;
+      }
+      .tfs-panel-body::-webkit-scrollbar { display: none; }
+      .tabby-status-layout.tabby-status-collapsed .tfs-panel-body {
+        opacity: 0;
+        pointer-events: none;
+        transform: translateX(-8px);
+      }
+      .tabby-status-layout.tfs-panel-toggling .tabby-status {
+        transition: width 200ms ease-out, background-color 160ms ease-out, border-color 160ms ease-out;
+      }
+      .tabby-status-layout.tfs-panel-toggling .tfs-panel-body {
+        transition: opacity 150ms ease-out, transform 200ms ease-out;
+      }
+      .tabby-status-layout.tfs-panel-toggling .content {
+        transition: margin 200ms ease-out !important;
+      }
+      .tabby-status-layout.tfs-panel-toggling sftp-panel {
+        transition: left 200ms ease-out, width 200ms ease-out !important;
+      }
       .tabby-status-layout .content {
-        margin: var(--tfs-content-margin) var(--tfs-content-margin) var(--tfs-content-margin) calc(var(--tfs-panel-width) + var(--tfs-content-margin)) !important;
+        margin: var(--tfs-content-margin) var(--tfs-content-margin) var(--tfs-content-margin) calc(var(--tfs-panel-active-width) + var(--tfs-content-margin)) !important;
       }
       .tabby-status-layout sftp-panel {
-        left: var(--tfs-panel-width) !important;
-        width: calc(100% - var(--tfs-panel-width)) !important;
+        left: var(--tfs-panel-active-width) !important;
+        width: calc(100% - var(--tfs-panel-active-width)) !important;
       }
       .tabby-status::-webkit-scrollbar { display: none; }
       .tfs-resizer { position: absolute; top: 0; right: 0; bottom: 0; width: 8px; cursor: ew-resize; z-index: 30; }
       .tfs-resizer::after { content: ""; position: absolute; top: 0; right: 2px; bottom: 0; width: 1px; background: color-mix(in srgb, var(--tfs-accent) 22%, transparent); }
       .tfs-resizer:hover::after, .tfs-resizing .tfs-resizer::after { width: 2px; background: color-mix(in srgb, var(--tfs-accent) 72%, transparent); }
+      .tabby-status-layout.tabby-status-collapsed .tfs-resizer { display: none; }
+      .tfs-collapse-toggle {
+        position: absolute;
+        top: 9px;
+        right: 10px;
+        width: 22px;
+        height: 22px;
+        display: grid;
+        place-items: center;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--tfs-muted);
+        box-shadow: none;
+        box-sizing: border-box;
+        cursor: pointer;
+        z-index: 42;
+        opacity: .72;
+        padding: 0;
+        transition: background-color 140ms ease-out, border-color 140ms ease-out, color 140ms ease-out, opacity 140ms ease-out;
+      }
+      .tfs-collapse-toggle:hover {
+        opacity: 1;
+        color: var(--tfs-text-primary);
+        border-color: var(--tfs-border);
+        background: color-mix(in srgb, var(--tfs-text-primary) 8%, transparent);
+      }
+      .tfs-collapse-toggle:focus-visible {
+        outline: 1px solid color-mix(in srgb, var(--tfs-accent) 72%, transparent);
+        outline-offset: 2px;
+      }
+      .tfs-collapse-icon {
+        width: 7px;
+        height: 7px;
+        border-top: 2px solid currentColor;
+        border-right: 2px solid currentColor;
+        transform: translateX(1px) rotate(225deg);
+        transition: transform 160ms ease-out;
+      }
+      .tabby-status-layout.tabby-status-collapsed .tfs-collapse-toggle {
+        top: 6px;
+        left: 5px;
+        right: auto;
+        width: 22px;
+        height: 22px;
+        border: 1px solid transparent;
+        border-radius: 7px;
+        background: transparent;
+        color: var(--tfs-muted);
+        opacity: 1;
+      }
+      .tabby-status-layout.tabby-status-collapsed .tfs-collapse-toggle:hover {
+        color: var(--tfs-text-primary);
+        border-color: var(--tfs-border);
+        background: color-mix(in srgb, var(--tfs-text-primary) 8%, transparent);
+      }
+      .tabby-status-layout.tabby-status-collapsed .tfs-collapse-icon {
+        width: 8px;
+        height: 8px;
+        border-width: 2px;
+        opacity: .8;
+        transform: translateX(-1px) rotate(45deg);
+      }
       .tfs-resizing { cursor: ew-resize !important; user-select: none !important; }
       .tabby-status .tfs-nowrap,
       .tabby-status .tfs-top span,
@@ -2804,7 +2970,7 @@ fi
       .tabby-status th,
       .tabby-status td { white-space: nowrap; min-width: 0; }
       .tfs-top, .tfs-ip, .tfs-kv { display: flex; align-items: center; gap: 8px; padding: 5px 10px; }
-      .tfs-top { font-size: 15px; font-weight: 700; padding-top: 10px; }
+      .tfs-top { font-size: 15px; font-weight: 700; padding-top: 10px; padding-right: 38px; }
       .tfs-dot { width: 8px; height: 8px; border-radius: 50%; background: #6f777a; display: inline-block; }
       .tfs-dot.on { background: #31c66b; box-shadow: 0 0 8px rgba(49,198,107,.5); }
       .tfs-ip { color: var(--tfs-muted); }
